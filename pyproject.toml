@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "archsheet"
+version = "0.1.0"
+description = "Blueprint-style architecture sheets (SVG/HTML/PNG) of PyTorch models, with symbolic tensor shapes"
+requires-python = ">=3.9"
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+png = ["cairosvg"]
+
+[project.scripts]
+archsheet = "archsheet.cli:main"
+
+[tool.setuptools]
+packages = ["archsheet"]
