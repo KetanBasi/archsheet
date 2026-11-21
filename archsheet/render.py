@@ -604,14 +604,28 @@ def to_html(svg, title, theme):
     return HTML.format(svg=svg, title=esc(title), bg=T["bg"], fg=T["fg"], dim=T["dim"])
 
 
-def to_png(svg_path, png_path, scale=2.0):
-    """Best-effort rasterisation. Returns the tool used or None."""
+def _svg_size(svg_path):
+    head = open(svg_path, encoding="utf-8").read(2000)
+    w = re.search(r'<svg[^>]*?\swidth="([\d.]+)', head)
+    h = re.search(r'<svg[^>]*?\sheight="([\d.]+)', head)
+    return (float(w.group(1)), float(h.group(1))) if w and h else (None, None)
+
+
+def to_png(svg_path, png_path, scale=2.0, width=None, max_side=16000):
+    """Best-effort rasterisation. `width` pins the PNG width in px; otherwise `scale` is used, reduced
+    so that neither side exceeds `max_side` px. Returns (tool, (px_w, px_h)) or None."""
     import shutil
     import subprocess
+    sw, sh = _svg_size(svg_path)
+    if sw and sh:
+        if width:
+            scale = width / sw
+        scale = min(scale, max_side / max(sw, sh))
+    size = (round(sw * scale), round(sh * scale)) if sw and sh else None
     try:
         import cairosvg
         cairosvg.svg2png(url=svg_path, write_to=png_path, scale=scale)
-        return "cairosvg"
+        return "cairosvg", size
     except Exception:
         pass
     for exe, cmd in (("rsvg-convert", ["rsvg-convert", "-z", str(scale), "-o", png_path, svg_path]),
@@ -619,5 +633,5 @@ def to_png(svg_path, png_path, scale=2.0):
                                    f"--export-dpi={96 * scale}"])):
         if shutil.which(exe):
             if subprocess.run(cmd, capture_output=True).returncode == 0:
-                return exe
+                return exe, size
     return None

@@ -1,13 +1,15 @@
 # Examples
 
-Three specs, each rendered as an overview (`--depth 2`) and a detail view (`--depth 4`) into
-[`output/`](output). Regenerate them from the repository root with:
+Five specs, rendered into [`output/`](output). The first three have an overview (`--depth 2`) and a detail
+view (`--depth 4`); the two DeepSeek specs have one sheet each. Regenerate everything from the repository root with:
 
 ```bash
 for n in gemma_like vlm two_phase; do
   python -m archsheet examples/${n}_spec.py -o examples/output/${n}_overview --depth 2 --png
   python -m archsheet examples/${n}_spec.py -o examples/output/${n}_detail   --depth 4 --png
 done
+python -m archsheet examples/deepseek_v41_flash_spec.py -o examples/output/deepseek_overview --depth 2 --png
+python -m archsheet examples/deepseek_csa2_modes_spec.py -o examples/output/deepseek_csa2_modes --png
 ```
 
 ## `gemma_like_spec.py` — Gemma-style language model
@@ -46,3 +48,42 @@ from archsheet import label, phase
 
 [detail PNG](output/two_phase_detail.png) · [detail HTML](output/two_phase_detail.html) ·
 [detail SVG](output/two_phase_detail.svg) · [overview HTML](output/two_phase_overview.html)
+
+## `deepseek_v41_flash_spec.py` — DeepSeek-V4.1-Flash, overall architecture
+
+Reproduces figure 3 of the [DeepSeek-V4.1-Flash paper](https://arxiv.org/abs/2609.19969): a 20-layer
+causal encoder and a 20-layer decoder side by side (two `phase(...)` regions), Engram memory feeding the
+encoder, the vision tower merged into the token embeddings, `×N` patterns of layer variants
+(encoder: 2 SWA layers, `Full + 5 × Reuse` twice, then the Engram layer 14 and the rest; decoder:
+`Full`, 3 × `Reuse`, then 4 × `Reindex + 3 × Reuse`), `Enc. hidden states` flowing into the decoder's
+first layer, and the DSpark draft head on top.
+
+<a href="output/deepseek_overview.png"><img src="output/deepseek_overview.png" width="360"></a>
+
+[overview HTML](output/deepseek_overview.html) · [overview SVG](output/deepseek_overview.svg)
+
+The released `inference/model.py` cannot be traced as is (custom fp8/fp4 kernels, KV caches in buffers,
+`.tolist()` in the expert router), so the spec is a **structural stand-in** with the released module names,
+shapes and config (hidden 5120, 64 heads × 512, 384 routed experts / top-6, mHC with 4 streams). What it
+replaces by plain torch ops is listed in the spec's docstring. Differences from the figure, on purpose:
+
+- Layers 1 and 14 carry an Engram gate, so they are drawn as their own boxes instead of being folded into
+  the `×N` patterns (the figure leaves that out).
+- The token-modality mask is a model buffer, not a graph input; drawing it would add a line to every MoE.
+- `512` is both the head dim and the top-k, so both are written `dh`.
+- At `--depth 3`/`4` the whole model is too dense to read (≈ 50–90 crossings); use the per-mode sheet below
+  for the attention internals.
+
+## `deepseek_csa2_modes_spec.py` — CSA2 Full / Reindex / Reuse
+
+Reproduces figure 4 of the same paper: one layer per mode, with the boxes of the figure (`main_q`,
+`swa_kv`, `main_kv`, `indexer_k`, `indexer_q`, `indexer`, `selection`, `concatenation`, `core_attention`)
+and the reused tensors (`main_kv_cache`, `indexer_k_cache`, `topk_cache`) entering from the earlier mode.
+
+<a href="output/deepseek_csa2_modes.png"><img src="output/deepseek_csa2_modes.png" width="360"></a>
+
+[HTML](output/deepseek_csa2_modes.html) · [SVG](output/deepseek_csa2_modes.svg)
+
+Not reproduced: the paper's figure 5 (hierarchical sparse indexer) is an illustration of selected
+positions and blocks, not a dataflow graph. The three regions are drawn as a staircase rather than level
+with each other because the layout raises a phase to the height of the tensors it consumes.

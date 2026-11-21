@@ -18,7 +18,7 @@ import torch
 from . import layout as _layout
 from .graph import Graph, Symbols, human
 from .render import Layout, Renderer, THEMES, to_html, to_png
-from .trace import Tracer
+from .trace import Tracer, meta_autocast_noop
 
 
 def load_spec(path):
@@ -65,6 +65,8 @@ def main(argv=None):
     ap.add_argument("--theme", choices=list(THEMES), default="light")
     ap.add_argument("--formats", default="svg,html", help="comma list of svg,html,png")
     ap.add_argument("--png", action="store_true", help="also write a PNG (needs cairosvg or rsvg-convert)")
+    ap.add_argument("--png-width", type=int, default=None, metavar="PX",
+                    help="PNG width in pixels (default: 2x the SVG size, never more than 16000 px on a side)")
     ap.add_argument("--no-collapse", action="store_true", help="draw every repeated layer")
     ap.add_argument("--hide-types", default="Identity,Dropout", help="module class names to treat as pass-through")
     ap.add_argument("--leaf-types", default="", help="module class names to draw as one box (no expansion)")
@@ -81,12 +83,16 @@ def main(argv=None):
     ap.add_argument("--outline-lines", type=int, default=250)
     ap.add_argument("--quiet", action="store_true")
     a = ap.parse_args(argv)
+    mod = load_spec(a.spec)
+    flags = getattr(mod, "FLAGS", None)         # a spec may set its own defaults: FLAGS = {"leaf_types": "ViT"}
+    if flags:
+        ap.set_defaults(**{k.replace("-", "_"): v for k, v in flags.items()})
+        a = ap.parse_args(argv)                 # command-line flags still win
 
     _layout.HIDE_SKIPS = a.hide_skips
-    mod = load_spec(a.spec)
     dev = torch.device(a.device)
     try:
-        with torch.device(dev):
+        with torch.device(dev), meta_autocast_noop():
             cfg = normalize(mod.build())
     except Exception:
         traceback.print_exc()
@@ -99,7 +105,7 @@ def main(argv=None):
                     hide_types=[s for s in a.hide_types.split(",") if s],
                     leaf_types=[s for s in a.leaf_types.split(",") if s]).install()
     try:
-        with torch.no_grad(), torch.device(dev), tracer:
+        with torch.no_grad(), torch.device(dev), meta_autocast_noop(), tracer:
             run = cfg.get("run")
             run(model) if run else model(*cfg["args"], **cfg["kwargs"])
     except Exception:
@@ -112,7 +118,8 @@ def main(argv=None):
     tracer.finalize()
 
     unwrap = {t for t in a.unwrap.split(",") if t}
-    if any(c.kind == "phase" for c in tracer.scene.children):      # phases already say "forward()" etc.
+    root_kids = tracer.root_node.children if tracer.root_node is not None else []
+    if any(c.kind == "phase" for c in list(tracer.scene.children) + list(root_kids)):   # phases already say "forward()"
         unwrap.add(type(model).__name__)
     g = Graph(tracer, sym, max_depth=a.depth, collapse=not a.no_collapse, unwrap=unwrap,
               node_ann=not a.edge_shapes)
@@ -135,9 +142,9 @@ def main(argv=None):
         open(out + ".html", "w", encoding="utf-8").write(to_html(svg, title, a.theme))
         written.append(out + ".html")
     if "png" in fmts:
-        tool = to_png(out + ".svg", out + ".png")
-        if tool:
-            written.append(out + ".png")
+        res = to_png(out + ".svg", out + ".png", width=a.png_width)
+        if res:
+            written.append(out + ".png" + (f" ({res[1][0]}x{res[1][1]} px)" if res[1] else ""))
         else:
             print("! PNG skipped: install cairosvg (pip install cairosvg) or rsvg-convert", file=sys.stderr)
 

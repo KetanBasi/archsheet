@@ -67,7 +67,7 @@ class Symbols:
             for c in range(2, 9):
                 put(c * self.vals[n], 3, f"{c}{n}", 16)
                 if self.vals[n] % c == 0:
-                    put(self.vals[n] // c, 2.8, f"{n}/{c}", 8 if c == 2 else 16)
+                    put(self.vals[n] // c, 2.8 + 0.02 * c, f"{n}/{c}", 8 if c == 2 else 16)
         for a, b in itertools.permutations(names, 2):
             if self.vals[b] > 1 and self.vals[a] % self.vals[b] == 0:
                 put(self.vals[a] // self.vals[b], 3.5, f"{a}/{b}", 4)
@@ -232,14 +232,56 @@ class Graph:
             else:
                 self._build_display(c, collapse)
 
+    @staticmethod
+    def _segments(sigs):
+        """Cheapest way to draw a layer list: plain runs of identical layers, and repeated multi-layer
+        patterns (period p, R >= 2 times). Cost = boxes drawn; ties prefer patterns that start later, so
+        `F R R R | (I R R R) x4` wins over `F | (R R R I) x4 | R R R`."""
+        n = len(sigs)
+        runs_in = lambda i, p: 1 + sum(sigs[i + t] != sigs[i + t - 1] for t in range(1, p))
+        best = [None] * (n + 1)
+        best[0] = (0, 0, None)
+        for i in range(n):
+            if best[i] is None:
+                continue
+            cost, tie, _ = best[i]
+
+            def relax(j, c, t, seg):
+                if best[j] is None or (c, t) < best[j][:2]:
+                    best[j] = (c, t, (i, seg))
+            j = i + 1
+            while j <= n:
+                relax(j, cost + 1, tie, ("run", 1))
+                if j == n or sigs[j] != sigs[i]:
+                    break
+                j += 1
+            if n <= 300:
+                for p in range(2, (n - i) // 2 + 1):
+                    r = 1
+                    while i + (r + 1) * p <= n and sigs[i + r * p:i + (r + 1) * p] == sigs[i:i + p]:
+                        r += 1
+                    if r >= 2 and runs_in(i, p) >= 2:
+                        for rr in range(2, r + 1):
+                            relax(i + rr * p, cost + runs_in(i, p) + 1, tie - i, ("pat", p))
+        segs, j = [], n
+        while j > 0:
+            i, (kind, p) = best[j][2]
+            segs.append((i, j, p if kind == "pat" else 1))
+            j = i
+        return segs[::-1]
+
     def _collapse_group(self, parent, prefix, members):
-        n = len(members)
         sigs = [self.sig(m) for m in members]
-        p = n
-        for cand in range(1, n):
-            if n % cand == 0 and all(sigs[i] == sigs[i % cand] for i in range(n)):
-                p = cand
-                break
+        short = prefix.rsplit(".", 1)[-1]
+        out = []
+        for lo0, hi0, p in self._segments(sigs):
+            out.extend(self._emit_segment(parent, prefix, short, members[lo0:hi0], sigs[lo0:hi0], p, lo0))
+        self._variant_notes([m for m in out if m.kind != "group"] +
+                            [r for g in out if g.kind == "group" for r in g.dchildren])
+        return out
+
+    def _emit_segment(self, parent, prefix, short, members, sigs, p, off):
+        n = len(members)
         R = n // p
         # runs of equal consecutive layers inside the first period
         runs, run_of_pos = [], []
@@ -256,14 +298,12 @@ class Graph:
             self.member[m.id] = (gid, i, ridx)
             if m is not reps[ridx]:
                 self._alias_subtree(m, reps[ridx])
-        short = prefix.rsplit(".", 1)[-1]
         for r, rep in zip(runs, reps):
             rep.repeat = len(r) * (R if p == 1 else 1)
-            lo, hi = r[0], r[-1]
+            lo, hi = off + r[0], off + r[-1]
             if p == 1:
-                lo, hi = 0, n - 1
+                lo, hi = off, off + n - 1
             rep.name = f"{short}[{lo}]" if lo == hi else f"{short}[{lo}–{hi}]"
-        self._variant_notes(reps)
         if p == 1 or R == 1:               # nothing repeats as a block: no wrapper needed
             return reps
         g = Node("group", short, "pattern", prefix)
@@ -309,7 +349,7 @@ class Graph:
         n.depth = depth
         n.expanded = (n.kind in ("scene", "group", "phase")) or (
             n.kind == "module" and not n.leaf and bool(n.dchildren) and depth < self.max_depth)
-        cd = depth if n.kind in ("scene", "group", "phase") else depth + 1
+        cd = depth if n.kind in ("scene", "group") else depth + 1      # a phase counts as a level, like the root module
         for c in n.dchildren or []:
             c.dparent = n
             self._assign(c, cd)

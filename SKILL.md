@@ -12,8 +12,9 @@ The model is traced on the `meta` device (no weights, no memory), so it works fo
 - **input → output shapes** on every node as symbols (`[b, s, h·dh]`); hidden reshapes under `out`:
   `↳ view,transpose [b, h, s, dh]`
 - real dataflow: residual adds (⊕), gating (⊗), fan-out (q/k/v), skips, concatenations `(s; t)`
-- repeated layers collapsed to `×N`, periodic patterns detected (`12 layers = 2 × pattern of 6`); attributes
-  that differ between variants are named on the owning node (`self_attn · sliding window 8` vs
+- repeated layers collapsed to `×N`, periodic patterns detected even after an irregular start or before
+  an irregular end (`12 layers = 2 × pattern of 6`, `Full + 3 × Reuse`, then `4 × (Reindex + 3 × Reuse)`);
+  attributes that differ between variants are named on the owning node (`self_attn · sliding window 8` vs
   `· global attention`)
 - branching-in graphs (vision tower → projector → text embeddings), multiple inputs (named after
   `forward()`'s parameters) and multi-entry-point models as dashed phase regions
@@ -36,8 +37,9 @@ uses `uv` / `poetry` / a venv, run the commands through it.
    ```bash
    PYTHONPATH=${CLAUDE_SKILL_DIR} python -m archsheet archsheet_spec.py -o docs/archsheet/model --png
    ```
-   Read the printed text **outline** first: shapes that stay numeric (`[b, s, 160]`) mean a missing symbol
-   (products of symbols are found automatically).
+   A spec may set flag defaults for itself (`FLAGS = dict(leaf_types="SparseAttn", depth=2)`);
+   command-line flags win. Read the printed text **outline** first: shapes that stay numeric
+   (`[b, s, 160]`) mean a missing symbol (products of symbols are found automatically).
 4. **Look** at the PNG (crop/resize if tall), tell the user the output paths (`.html` is nicest to browse),
    and iterate with the flags until readable. Usually two views: overview (`--depth 2`) and detail
    (`--depth 4 --ops key`).
@@ -78,8 +80,11 @@ Plain `model(**inputs)` already handles branch-in (every tensor is followed from
 input its own symbol (`n` patches, `hw` image size ...).
 
 For several entry points or persistent state (stored K/V, KV cache, encoder/decoder split) give the spec a
-`run(model)`, wrap each call in `phase(...)` and name tensors with `label(...)`. Tensors kept on the model
-between calls keep their origin, so the arrow between phases is drawn automatically:
+`run(model)` and wrap each call in `phase(...)`, or open `phase(...)` inside a `forward()` to split one pass
+into regions (encoder | decoder). Name tensors with `label(...)`. A phase counts as one `--depth` level,
+and a graph input read by one phase only is drawn inside it (inputs shared by several phases are not
+supported: make them model state). Tensors kept on the model between calls keep their origin, so the arrow between
+phases is drawn automatically:
 
 ```python
 from archsheet import phase, label
@@ -102,7 +107,7 @@ is dissolved automatically when phases are used; `--unwrap Cls` dissolves others
 | `--depth N` | module levels to expand (default 4); `2` = block overview |
 | `--ops none\|merge\|key\|all` | functional ops drawn as nodes: `key` (default) adds/muls/matmul/sdpa/softmax/cat…; `merge` only ops with ≥2 tensor inputs; `none` modules only; `all` everything non-reshape |
 | `--theme light\|blueprint` | white, or dark-blue engineering style with grid |
-| `--png` | also rasterise (cairosvg or rsvg-convert) |
+| `--png` | also rasterise (cairosvg or rsvg-convert); `--png-width PX` pins the width (default 2× SVG, ≤ 16000 px per side) |
 | `--no-collapse` | draw every repeated layer instead of `×N` |
 | `--hide-types A,B` | classes treated as pass-through (default `Identity,Dropout`) |
 | `--unwrap A,B` | dissolve wrapper modules (children drawn in their place) |
@@ -122,14 +127,18 @@ crossings (> ~12) or short jogs (> ~3) mean the view is too dense: lower `--dept
 change the spec or flags and rerun.
 
 - **`forward pass failed`**: the model does something meta tensors can't (`.item()`, `if x.any()`,
-  `nonzero`, value-routed MoE). Retry `--device cpu` with tiny dims, or add `run=` in the spec.
+  `nonzero`, value-routed MoE; `torch.autocast` on meta is already a no-op while tracing). Retry `--device cpu` with tiny dims, or add `run=` in the
+  spec.
 - **`symbols X and Y have the same value`**: change the example sizes.
 - **Module missing**: never called in `forward`, or listed in `--hide-types`.
 - **Layers not collapsed**: they differ in a config attribute or shape (the outline shows what) or are not
-  in a `ModuleList`/`Sequential`. A module called several times (weight sharing) is drawn once per call.
+  in a `ModuleList`/`Sequential`. A module called several times (weight sharing, one `rotary_emb` used by every layer) is drawn once per call. Work
+  done by plain functions or methods inside a block (not modules) appears only as hidden reshapes and key
+  ops: wrap it in a small `nn.Module` to get a box.
 - Only PyTorch is supported; for JAX/TF port the structure to a stub `nn.Module` with the same shapes.
 
 ## Files
 
 `archsheet/` (`cli` · `trace` · `graph` · `layout` · `render`), `templates/spec_template.py`,
-`examples/{gemma_like,vlm,two_phase}_spec.py` (+ `examples/output/` pre-rendered results).
+`examples/{gemma_like,vlm,two_phase,deepseek_v41_flash,deepseek_csa2_modes}_spec.py` (+ `examples/output/`
+pre-rendered results; the two DeepSeek specs follow figures 3 and 4 of the V4.1-Flash paper).

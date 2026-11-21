@@ -235,6 +235,7 @@ class Tracer(TorchFunctionMode):
         self.leaf_types = set(leaf_types)
         self.scene = Node("scene", "scene")
         self.cur_top = self.scene
+        self.phase_of, self._phase_stack = {}, []
         self.labels, self.pending_out = {}, []
         self.total_params = sum(p.numel() for p in root.parameters())
         self.root_node = None
@@ -275,13 +276,28 @@ class Tracer(TorchFunctionMode):
                 self.edges.append(Edge(p[0], dst, p[1], meta(t), p[2], self.labels.get((p[0].id, p[1]), ""), p[3]))
 
     def begin_phase(self, name):
+        """Phases opened between module calls (run(model)) hang off the scene; phases opened inside a
+        module's forward() become children of that module and adopt the calls made while they are open."""
         n = Node("phase", name, "phase")
-        n.parent = self.scene
-        self.scene.children.append(n)
-        self.cur_top = n
+        host = self.stack[-1] if self.stack else self.scene
+        n.parent = host
+        host.children.append(n)
+        if self.stack:
+            self.phase_of[host.id] = n
+        else:
+            self.cur_top = n
+        self._phase_stack.append(host)
 
     def end_phase(self):
-        self.cur_top = self.scene
+        host = self._phase_stack.pop()
+        if host is self.scene:
+            self.cur_top = self.scene
+        else:
+            self.phase_of.pop(host.id, None)
+
+    def _parent(self):
+        host = self.stack[-1]
+        return self.phase_of.get(host.id, host)
 
     def label_tensor(self, t, text):
         p = self.prov.get(id(t))
@@ -309,7 +325,7 @@ class Tracer(TorchFunctionMode):
             named = named_inputs(module, args, kwargs)
             node.in_names = [nm for nm, _ in named]
             node.in_metas = [meta(t) for _, t in named]
-            parent = top if first else self.stack[-1]
+            parent = top if first else self._parent()
             node.parent = parent
             parent.children.append(node)
             if first and self.root_node is None:
@@ -368,8 +384,29 @@ class Tracer(TorchFunctionMode):
             top.children.append(n)
             self._set_prov(t, n, meta(t))
 
+    def _phase_of_node(self, n):
+        while n is not None:
+            if n.kind == "phase":
+                return n
+            n = n.parent
+        return None
+
+    def _home_inputs(self):
+        """A graph input that only one phase reads is drawn inside that phase (at its bottom)."""
+        for n in list(self.scene.children):
+            if n.kind != "input":
+                continue
+            ph = {id(self._phase_of_node(e.dst)): self._phase_of_node(e.dst) for e in self.edges if e.src is n}
+            if len(ph) == 1:
+                p = next(iter(ph.values()))
+                if p is not None and p is not n.parent:
+                    self.scene.children.remove(n)
+                    n.parent = p
+                    p.children.insert(0, n)
+
     def finalize(self):
         """Create output nodes for top-level results that nothing consumed afterwards."""
+        self._home_inputs()
         for top, items in self.pending_out:
             for name, t in items:
                 p = self.prov.get(id(t))
@@ -410,7 +447,7 @@ class Tracer(TorchFunctionMode):
             srcs.setdefault(p[0].id, p)
         if self._should_show(name, len(srcs)):
             node = Node("op", name, name)
-            node.parent = self.stack[-1]
+            node.parent = self._parent()
             node.parent.children.append(node)
             node.in_metas = [meta(t) for t in ins]
             node.out_metas = [meta(t) for t in outs]
@@ -430,3 +467,44 @@ class Tracer(TorchFunctionMode):
             for t in outs:
                 self._set_prov(t, n0, m0, ops0 + (name,), tr0 + ((self.stack[-1], meta(t), name),))
         return out
+
+
+class _NoAutocast:
+    """Stand-in for torch.autocast(device_type="meta"): context manager and decorator, does nothing."""
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __call__(self, fn):
+        return fn
+
+
+@contextlib.contextmanager
+def meta_autocast_noop():
+    """HF rotary embeddings (and many custom fp32 regions) open `torch.autocast(device_type="meta")`,
+    which torch rejects. Make that one a no-op while tracing; every other device is untouched."""
+    targets = [(torch, "autocast")]
+    for mod in (getattr(torch, "amp", None), getattr(getattr(torch, "amp", None), "autocast_mode", None)):
+        if mod is not None and hasattr(mod, "autocast"):
+            targets.append((mod, "autocast"))
+    orig = [(m, n, getattr(m, n)) for m, n in targets]
+
+    def make(real):
+        def autocast(*a, **k):
+            dev = k.get("device_type", a[0] if a and isinstance(a[0], str) else None)
+            return _NoAutocast() if dev == "meta" else real(*a, **k)
+        autocast.__wrapped__ = real
+        return autocast
+
+    try:
+        for m, n, real in orig:
+            setattr(m, n, make(real))
+        yield
+    finally:
+        for m, n, real in orig:
+            setattr(m, n, real)
