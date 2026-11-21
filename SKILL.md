@@ -25,14 +25,23 @@ it works for huge models. Unlike a block diagram it shows:
   `in x=[b, s, d]` / `ext_k=[b, h, t, dh]` / `ext_v=[...]`; concatenations show the joined dim as
   `(s; t)`: `cat · dim 2  [b, h, (s; t), dh]`
 
-Requires: `torch >= 2.1`. Optional: `cairosvg` (or `rsvg-convert`) for `--png`.
-
 The tool is the Python package `archsheet/` in this skill directory (`cli`, `trace`, `graph`, `layout`,
-`render`). Run it as `python -m archsheet` with this directory on `PYTHONPATH` (or `pip install -e .`,
-which also provides an `archsheet` command).
+`render`). It has **no environment of its own**: it must run with the *project's* Python (the one that
+can import the user's model), because the spec imports the model code. Nothing is installed for the
+skill itself — `PYTHONPATH=${CLAUDE_SKILL_DIR}` is enough.
+
+**Requirements (check before the first run, in the project's environment):**
+
+- `torch >= 2.1` — required. Any PyTorch project already has it. Check with
+  `python -c "import torch"`; if the project uses `uv` / `poetry` / a venv, run every command below
+  through it (`uv run python …`, `poetry run python …`, `.venv/bin/python …`).
+- `cairosvg` (or `rsvg-convert`) — only for `--png`. If it is missing, do not stop: SVG and HTML are
+  still written. Offer `pip install cairosvg` (in that same environment) and ask before installing.
 
 ## Workflow
 
+0. **Preflight.** In the project's environment run `python -c "import torch"` (see Requirements above). If it
+   fails, stop and tell the user which interpreter lacks torch; do not install torch yourself.
 1. **Find the model.** Locate the `nn.Module` class and its config in the user's repo (or ask which
    one). Do not modify their model code.
 2. **Write a spec** in the user's repo (e.g. `archsheet_spec.py`) by copying
@@ -43,9 +52,9 @@ which also provides an `archsheet` command).
      **Values must be unique and dynamic dims must not collide with config dims** — use e.g.
      `b=3, s=17`. A spurious match (e.g. `10 = 2·b`) is the main failure mode.
    - HF models: `AutoModelForCausalLM.from_config(cfg)` inside `build()` works (no weights downloaded).
-3. **Run** (from anywhere; paths relative to this skill directory):
+3. **Run** (from anywhere; with the project's Python):
    ```bash
-   PYTHONPATH=<skill_dir> python -m archsheet archsheet_spec.py -o docs/archsheet/model --png
+   PYTHONPATH=${CLAUDE_SKILL_DIR} python -m archsheet archsheet_spec.py -o docs/archsheet/model --png
    ```
    It prints a text **outline** with all shapes. Read it to verify the architecture and the symbols
    *before* looking at the picture: shapes that stay numeric (e.g. `[b, s, 160]`) mean a symbol is

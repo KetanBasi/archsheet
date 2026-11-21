@@ -72,10 +72,12 @@ dashed cards are functional ops (SDPA, `cat`, `masked_scatter` ...), circles are
 ## As a Claude Code skill
 
 This repository is also a skill: [`SKILL.md`](SKILL.md) tells Claude how to find the model, write the
-spec, run the tool and read the result. Put the checkout where Claude Code looks for skills, e.g.
+spec, run the tool and read the result.
 
 ```bash
 git clone https://github.com/KetanBasi/archsheet ~/.claude/skills/archsheet
+pip install torch            # required
+pip install cairosvg         # optional, only for --png
 ```
 
 ## Layout
