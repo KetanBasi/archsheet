@@ -817,7 +817,51 @@ def layout_items(L, n, items, header_h, header_w, pad):
                 x = min(ends, key=lambda e: abs(e - m)) if ends else min(max(m, lo), hi)
                 for d in seg:
                     d.lx = x
+
+    def settle_branches():
+        """A branch that sits beside its consumer is left wherever the trunk steps pushed it; pull it back to
+        the middle of its neighbours (the row keeps its order and spacing)."""
+        for it in range(4):
+            for l in (range(0, K + 1) if it % 2 == 0 else range(K, -1, -1)):
+                nodes = layers[l]
+                if not any(v.kind == "dummy" and v.beside and v.lx - (v.anchor.lx + v.anchor.w) > 120 for v in nodes):
+                    continue
+                des, wt = [], []
+                for v in nodes:
+                    if v.kind == "dummy" and v.beside and v.lx - (v.anchor.lx + v.anchor.w) > 120:     # stranded
+                        vals = [(p.frm.lx + out_off[(p.frm.id, p.gk)] - in_off[(v.id, id(p))], 1.0) for p in ins_of[v.id]]
+                        vals += [(p.to.lx + in_off[(p.to.id, id(p))] - out_off[(v.id, p.gk)], 1.0) for p in outs_of[v.id]]
+                        if vals:
+                            des.append(sum(x for x, _ in vals) / len(vals))
+                            wt.append(3.0)
+                            continue
+                    des.append(v.lx)
+                    wt.append(100.0)
+                _pav(nodes, des, wt, gap)
+    if n.kind == "phase":                      # a tall phase should not keep a lane of empty space
+        settle_branches()
     straighten_trunks()
+    def reorder_ports():
+        """Ports were handed out before the rows settled. With the final positions, give the leftmost port to the
+        flow that arrives (leaves) furthest to the left, so lines into / out of one card never cross each other."""
+        src_at = lambda q: q.frm.lx + out_off.get((q.frm.id, q.gk), 0.0)
+        dst_at = lambda q: q.to.lx + in_off.get((q.to.id, id(q)), 0.0)
+        for v in all_nodes:
+            if v.kind == "dummy" or v.w == 0:
+                continue
+            ins = [q for q in ins_all[v.id] if not q.lane]
+            if len(ins) > 1 and not any(s_.dst_tag for q in ins for s_ in q.finals if s_.dst is v):
+                offs = sorted(in_off[(v.id, id(q))] for q in ins)
+                for o, q in zip(offs, sorted(ins, key=src_at)):
+                    in_off[(v.id, id(q))] = o
+            groups = defaultdict(list)
+            for q in outs_all[v.id]:
+                groups[q.gk].append(q)
+            if len(groups) > 1 and not any(s_.src_tag for q in outs_all[v.id] for s_ in q.segs if s_.src is v):
+                offs = sorted(out_off[(v.id, gk)] for gk in groups)
+                for o, gk in zip(offs, sorted(groups, key=lambda g: sum(dst_at(q) for q in groups[g]) / len(groups[g]))):
+                    out_off[(v.id, gk)] = o
+    reorder_ports()
     minx = min((v.lx for v in all_nodes), default=0)      # tight on the left: no empty margin
     for v in all_nodes:
         v.lx -= minx
