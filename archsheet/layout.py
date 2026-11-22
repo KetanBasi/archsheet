@@ -53,6 +53,7 @@ class Piece:
         self.frm, self.to, self.gk = frm, to, gk
         self.segs, self.finals = [], []
         self.side = False
+        self.xside = None        # 'out' / 'in': container leaves / enters through its side border: one straight line
         self.lane = False        # residual skip: routed after placement in a lane right of the content
         self.lane_x = 0.0
         self.hidden = False      # --hide-skips: keeps its lane / track reserved but is not drawn
@@ -255,6 +256,11 @@ def layout_items(L, n, items, header_h, header_w, pad):
                 p.finals.append(s)
             if side and i == len(nodes) - 2:
                 p.side = True
+            if len(nodes) == 2:
+                if v.id in lat_out and s.src_tag is not None and s.src_tag.side == "R":
+                    p.side, p.xside = True, "out"
+                elif u.id in lat_in and s.dst_tag is not None and s.dst_tag.side == "L":
+                    p.side, p.xside = True, "in"
         seg_ok.append(s)
     # a trunk that keeps going past a real consumer of the SAME tensor (input_ids -> embed_tokens AND on to
     # masked_scatter) branches off to the right of that consumer; the consumer itself stays on the straight line
@@ -267,6 +273,7 @@ def layout_items(L, n, items, header_h, header_w, pad):
                 for gk_, ch in chain_of.items():
                     if ch is d.chain and d.layer in cons_in_layer[gk_]:
                         d.beside = True
+                        d.anchor = cons_in_layer[gk_][d.layer]
                         d.seq = cons_in_layer[gk_][d.layer].seq + 0.1
     K = max([layer.get(i.id, 0) for i in items] + list(layers.keys()) + [0])
 
@@ -352,6 +359,81 @@ def layout_items(L, n, items, header_h, header_w, pad):
                                           if outs_of[v.id] else cx(v), v.beside if v.kind == "dummy" else 0))
             fix_after(layers[l])
             place_all()
+
+    # crossing minimisation: the barycentre sweeps above leave avoidable crossings behind. Sift every node to
+    # the position in its row that crosses the fewest edges of the rows above and below, until nothing improves.
+    def sift_rows():
+        up, down = defaultdict(list), defaultdict(list)
+        LEFT, RIGHT = object(), object()     # flows that enter / leave through a phase border start / end beyond the row
+        for p in pieces.values():
+            if p.side:
+                continue
+            if p.frm.id in lat_in and p.to.id not in pinned:
+                down[id(p.to)].append(LEFT)
+            elif p.to.id in lat_out and p.frm.id not in pinned:
+                up[id(p.frm)].append(RIGHT)
+            elif p.frm.id not in pinned and p.to.id not in pinned:
+                up[id(p.frm)].append(p.to)
+                down[id(p.to)].append(p.frm)
+        pos = {id(LEFT): -1e6, id(RIGHT): 1e6}
+
+        def reindex(nodes):
+            for i, v in enumerate(nodes):
+                pos[id(v)] = i + 0.0
+        for ls in layers.values():
+            reindex(ls)
+
+        def units_of(nodes):
+            """a consumer and the trunk dummies that must stay right beside it move together"""
+            units = []
+            for v in nodes:
+                a = (getattr(v, "anchor", None) or getattr(v, "after", None)) if v.kind == "dummy" else None
+                if a is not None and units and units[-1][0] is a or (a is not None and units and a in units[-1]):
+                    units[-1].append(v)
+                else:
+                    units.append([v])
+            return units
+
+        def delta(left, right):      # crossings added by swapping two adjacent units (negative = fewer)
+            t = 0
+            for nb in (up, down):
+                for x in left:
+                    for y in right:
+                        for a in nb[id(x)]:
+                            for b in nb[id(y)]:
+                                if a is not b:
+                                    t += (pos[id(a)] < pos[id(b)]) - (pos[id(a)] > pos[id(b)])
+            return t
+        for _ in range(8):
+            changed = False
+            for l in sorted(layers):
+                nodes = layers[l]
+                if len(nodes) < 2 or any(v.kind == "phase" for v in nodes):
+                    continue
+                units = units_of(nodes)
+                for u in list(units):
+                    if u[0].kind == "dummy" and (getattr(u[0], "beside", False) or getattr(u[0], "after", None) is not None):
+                        continue                                  # glued trunk that found no consumer next to it
+                    i = units.index(u)
+                    best, where, cum = 0, i, 0
+                    for j in range(i - 1, -1, -1):
+                        cum += delta(units[j], u)
+                        if cum < best:
+                            best, where = cum, j
+                    cum = 0
+                    for j in range(i + 1, len(units)):
+                        cum += delta(u, units[j])
+                        if cum < best:
+                            best, where = cum, j
+                    if where != i:
+                        units.insert(where, units.pop(i))
+                        nodes[:] = [v for un in units for v in un]
+                        reindex(nodes)
+                        changed = True
+            if not changed:
+                break
+    sift_rows()
+    place_all()
 
     # ------------------------------------------------------------------ 4. ports + x alignment
     out_off, in_off = {}, {}
@@ -510,6 +592,7 @@ def layout_items(L, n, items, header_h, header_w, pad):
             des = [target if id(v) in ids_ else v.lx for v in nodes]
             wt = [200.0 if id(v) in ids_ else 0.05 for v in nodes]
             _pav(nodes, des, wt, gap)
+    trunk_x = {id(d): d.lx for ch in chains.values() if len(ch) > 1 for d in ch}
     # spines: every chain of links that is central at both ends (input -> embed -> merge -> layers -> head,
     # norm1 -> k -> cat -> SDPA -> o ...) becomes exactly ONE vertical line
     def spines():
@@ -547,8 +630,8 @@ def layout_items(L, n, items, header_h, header_w, pad):
         for l in range(K + 1):
             nodes = layers[l]
             if nodes:
-                _pav(nodes, [target.get(v.id, v.lx) for v in nodes],
-                     [100.0 if v.id in target else 0.5 for v in nodes], gap)
+                _pav(nodes, [target.get(v.id, trunk_x.get(id(v), v.lx)) for v in nodes],
+                     [100.0 if v.id in target else (60.0 if id(v) in trunk_x else 0.5) for v in nodes], gap)
 
     # snap: nearly-straight edges become exactly straight (move the node with the fewest links)
     for _ in range(3):
@@ -623,6 +706,46 @@ def layout_items(L, n, items, header_h, header_w, pad):
         if mover is not None and not any(o is not mover and o.lx - 1 <= anchor.lx <= o.lx + o.w + 1
                                          for o in layers[mover.layer if mover.kind == "dummy" else layer[mover.id]]):
             mover.lx = anchor.lx
+    # trunks: a long flow (a chain of dummies) runs as ONE vertical line wherever the rows around it leave room,
+    # and bends only where a node is in the way (stabbing the free interval of each row with as few x as possible)
+    def straighten_trunks():
+        INF = 1e9
+        for ch in sorted(chains.values(), key=lambda c: -len(c)):
+            ch = sorted(ch, key=lambda d: d.layer)
+            if len(ch) < 2:
+                continue
+            def free(d):
+                nodes = layers[d.layer]
+                i = nodes.index(d)
+                lo = nodes[i - 1].lx + nodes[i - 1].w + gap(nodes[i - 1], d) if i > 0 else -INF
+                hi = nodes[i + 1].lx - d.w - gap(d, nodes[i + 1]) if i + 1 < len(nodes) else INF
+                return lo, hi
+            seg, lo, hi = [], -INF, INF
+            runs = []
+            for d in ch:
+                a_, b_ = free(d)
+                if seg and (max(lo, a_) > min(hi, b_) + 1e-6 or d.layer != seg[-1].layer + 1):
+                    runs.append((seg, lo, hi))
+                    seg, lo, hi = [], -INF, INF
+                seg.append(d)
+                lo, hi = max(lo, a_), min(hi, b_)
+            runs.append((seg, lo, hi))
+            for seg, lo, hi in runs:
+                m = sum(d.lx for d in seg) / len(seg)
+                ends = []                       # a run that touches a real node joins that node's port exactly
+                if seg[0] is ch[0] and ins_of[seg[0].id]:
+                    q = ins_of[seg[0].id][0]
+                    if q.frm.kind != "dummy" and (q.frm.id, q.gk) in out_off:
+                        ends.append(q.frm.lx + out_off[(q.frm.id, q.gk)])
+                if seg[-1] is ch[-1] and outs_of[seg[-1].id]:
+                    q = outs_of[seg[-1].id][0]
+                    if q.to.kind != "dummy" and (q.to.id, id(q)) in in_off:
+                        ends.append(q.to.lx + in_off[(q.to.id, id(q))])
+                ends = [e for e in ends if lo <= e <= hi]
+                x = min(ends, key=lambda e: abs(e - m)) if ends else min(max(m, lo), hi)
+                for d in seg:
+                    d.lx = x
+    straighten_trunks()
     minx = min((v.lx for v in all_nodes), default=0)      # tight on the left: no empty margin
     for v in all_nodes:
         v.lx -= minx
@@ -712,6 +835,49 @@ def layout_items(L, n, items, header_h, header_w, pad):
             sx = sum(port_x(p) for p in ps) / len(ps)
             return (0, -sx) if d < 0 else ((1, sx) if d > 0 else (2, sx))
         levels.sort(key=lvl_key)
+
+        def live(lv):
+            return [(p.gk, port_x(p), land_x(p)) for tr in lv["trs"] for p in tr["pieces"]
+                    if p.frm.id not in lat_in and p.to.id not in lat_out]
+        cache = {id(lv): live(lv) for lv in levels}
+
+        def above(X, Y):
+            """crossings between two levels if X is drawn above Y (nearer the target): Y's target vertical runs up
+            through X's horizontal, and X's source vertical runs down through Y's horizontal"""
+            c = 0
+            for gx, sx, tx in cache[id(X)]:
+                for gy, sy, ty in cache[id(Y)]:
+                    if gx == gy:
+                        continue
+                    c += (min(sx, tx) + 1 < ty < max(sx, tx) - 1) + (min(sy, ty) + 1 < sx < max(sy, ty) - 1)
+            return c
+        pair = {}
+        for X in levels:
+            for Y in levels:
+                if X is not Y:
+                    pair[(id(X), id(Y))] = above(X, Y)
+
+        def total(order):
+            return sum(pair[(id(order[i]), id(order[j]))] for i in range(len(order)) for j in range(i + 1, len(order)))
+        if 1 < len(levels) <= 40:
+            for _ in range(4):
+                improved = False
+                for lv in list(levels):
+                    i = levels.index(lv)
+                    base = total(levels)
+                    best, where = base, i
+                    rest = levels[:i] + levels[i + 1:]
+                    for j in range(len(rest) + 1):
+                        if j == i:
+                            continue
+                        c = total(rest[:j] + [lv] + rest[j:])
+                        if c < best:
+                            best, where = c, j
+                    if where != i:
+                        levels[:] = rest[:where] + [lv] + rest[where:]
+                        improved = True
+                if not improved:
+                    break
         gap_levels[g] = levels
         gap_h[g] = max(26, TOP_CLEAR + BOT_CLEAR + sum(lv["h"] for lv in levels)) if levels else 26
     # a flow entering from the left must never sit LOWER than where it left the previous phase
@@ -758,9 +924,13 @@ def layout_items(L, n, items, header_h, header_w, pad):
         if it.id in pinned:
             it.x = 0.0 if it.id in lat_in else n.w
     for p in pieces.values():
-        if p.frm.id in lat_in:
+        if p.xside == "in":
+            p.frm.y = p.to.y + p.segs[0].dst_tag.y
+        elif p.xside == "out":
+            p.to.y = p.frm.y + p.segs[0].src_tag.y
+        elif p.frm.id in lat_in:
             p.frm.y = track_y.get(id(p), p.frm.y if hasattr(p.frm, "y") else 0)
-        if p.to.id in lat_out:
+        elif p.to.id in lat_out:
             p.to.y = track_y.get(id(p), 0)
     n.pieces, n.labels = [], []
     side_count = defaultdict(int)
@@ -790,6 +960,14 @@ def layout_items(L, n, items, header_h, header_w, pad):
             n.pieces.append(dict(pts=[(sx, sy), (sx, ty), (lx, ty), (lx, cy), (t.x + t.w, cy)], arrow=True,
                                  shape=p.segs[0].mfrom, fid=p.gk[1]))
             continue
+        if p.xside:
+            y0 = (f.y + p.segs[0].src_tag.y) if p.xside == "out" else (t.y + p.segs[0].dst_tag.y)
+            a, b = (f.x + f.w, n.w) if p.xside == "out" else (0.0, t.x)
+            for o in items:
+                if o is not f and o is not t and o.kind != "tag" and o.x < b and o.x + o.w > a and o.y < y0 < o.y + o.h:
+                    L.warnings.append(f"side line of {f if p.xside == 'out' else t} runs through {o}")
+            n.pieces.append(dict(pts=[(a, y0), (b, y0)], arrow=False, shape=p.segs[0].mfrom, fid=p.gk[1]))
+            continue
         if p.side:
             k = side_count[t.id]
             side_count[t.id] += 1
@@ -808,6 +986,17 @@ def layout_items(L, n, items, header_h, header_w, pad):
         else:
             ex = t.x + in_off.get((t.id, id(p)), 0.0)
             ey = (0.0 if t.id in tout else (t.ly if t.kind == "dummy" else t.y + t.h))
+        if 0.5 < abs(sx - ex) < JOG and not (f.id in lat_in or t.id in lat_out):
+            # a trunk that is a hair off the port it leaves from / arrives at: slide the port onto the trunk
+            if t.kind == "dummy" and f.kind != "dummy" and f.id not in tin and f.x + 5 < ex < f.x + f.w - 5 \
+                    and len([q for q in outs_all[f.id] if q.gk == p.gk]) == 1 \
+                    and all(abs(f.x + o - ex) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
+                out_off[(f.id, p.gk)] = ex - f.x
+                sx = ex
+            elif f.kind == "dummy" and t.kind != "dummy" and t.id not in tout and t.x + 5 < sx < t.x + t.w - 5 \
+                    and all(abs(t.x + o - sx) > 6 for (tid, pid), o in in_off.items() if tid == t.id and pid != id(p)):
+                in_off[(t.id, id(p))] = sx - t.x
+                ex = sx
         if f.id in lat_in:
             pts = [(sx, ty), (ex, ty), (ex, ey)]
         elif t.id in lat_out:
@@ -815,13 +1004,8 @@ def layout_items(L, n, items, header_h, header_w, pad):
         elif 0.5 < abs(sx - ex) < 3.0 and (f.kind == "dummy" or t.kind == "dummy"):
             x = ex if f.kind == "dummy" else sx           # a trunk that is a hair off its port: follow the real end
             pts = [(x, sy), (x, ey)]
-        elif 0.5 < abs(sx - ex) < JOG and (f.kind == "dummy" or t.kind == "dummy" or snap_x(p, f, t, sx, ex) is not None):
-            if f.kind == "dummy":
-                x = ex
-            elif t.kind == "dummy":
-                x = sx
-            else:
-                x = snap_x(p, f, t, sx, ex)
+        elif 0.5 < abs(sx - ex) < JOG and f.kind != "dummy" and t.kind != "dummy" and snap_x(p, f, t, sx, ex) is not None:
+            x = snap_x(p, f, t, sx, ex)
             pts = [(x, sy), (x, ey)]                     # a hair off: one straight line instead of a double bend
         elif abs(sx - ex) > 0.5:
             pts = [(sx, sy), (sx, ty), (ex, ty), (ex, ey)]

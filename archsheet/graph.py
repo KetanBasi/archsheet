@@ -551,6 +551,11 @@ class Graph:
         return sg
 
     def _lift(self):
+        lat_use = {}                # boundary tag -> True while every flow through it runs phase to phase
+
+        def mark(tag, cross):
+            u = lat_use.setdefault(id(tag), [tag, True])
+            u[1] = u[1] and cross
         for e in self.edges:
             if id(e) in self._dropped or self._cross_iteration(e.src, e.dst):
                 continue
@@ -576,6 +581,7 @@ class Graph:
                 X = pu[k]
                 tm = self._leaving(e, X)
                 tag = self._tag(X, "out", (u.id, tm), tm, "")
+                mark(tag, cross_phase)
                 sg = self._seg(e, pu[k - 1], tag, self._leaving(e, pu[k - 1]), tm, X)
                 if k > 1:                                   # nested container: line up with its own port
                     sg.src_tag = pu[k - 1].tags_out.get((u.id, self._leaving(e, pu[k - 1])))
@@ -590,6 +596,7 @@ class Graph:
                 X = pv[k]
                 tm = self._entering(e, X)
                 tag = self._tag(X, "in", (u.id, tm), tm, pu[lu - 1].name)
+                mark(tag, cross_phase)
                 if cross_phase:                              # arrives from the left: sort left of the main input
                     tag.bias = -0.3
                 sg = self._seg(e, tag, pv[k - 1], tm, self._entering(e, pv[k - 1]), X)
@@ -608,6 +615,11 @@ class Graph:
                 if top.dst_tag is not None:
                     top.dst_tag.side = "L"      # enters the later phase through its left border
             self._add(lca, top)
+        # a tensor that only travels to another phase leaves / enters its containers through the side
+        # border (at the height of its producer / consumer) instead of looping over the container's top / bottom
+        for tag, only_cross in lat_use.values():
+            if only_cross:
+                tag.side = "R" if tag.name == "out" else "L"
 
     # ---------------------------------------------------------- hidden-op annotations live on nodes
     _GLYPH = {"add", "mul", "sub", "div"}

@@ -491,18 +491,26 @@ class Tracer(TorchFunctionMode):
         return None
 
     def _home_inputs(self):
-        """A graph input that only one phase reads is drawn inside that phase (at its bottom)."""
+        """A graph input is drawn inside the phase that reads it (at its bottom), once per reading phase."""
         for n in list(self.scene.children):
             if n.kind != "input":
                 continue
             ph = {id(self._phase_of_node(e.dst)): self._phase_of_node(e.dst) for e in self.edges if e.src is n}
             if ph and None not in ph.values():
-                # read by several phases: it lives in the first one, the others get a flow from there
-                p = min(ph.values(), key=lambda q: q.id)
-                if p is not n.parent:
-                    self.scene.children.remove(n)
-                    n.parent = p
-                    p.children.insert(0, n)
+                # read by several phases: every phase that reads it gets its own copy of the input (same name and
+                # shape) at its bottom, so no line has to cross from one phase to the other
+                order = sorted(ph.values(), key=lambda q: q.id)
+                self.scene.children.remove(n)
+                for k, p in enumerate(order):
+                    m = n
+                    if k:
+                        m = Node("input", n.name, "input")
+                        m.out_metas, m.in_metas, m.out_ann, m.seq = list(n.out_metas), list(n.in_metas), list(n.out_ann), n.seq
+                        for e in self.edges:
+                            if e.src is n and self._phase_of_node(e.dst) is p:
+                                e.src = m
+                    m.parent = p
+                    p.children.insert(0, m)
 
     def finalize(self):
         """Create output nodes for top-level results that nothing consumed afterwards."""

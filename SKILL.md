@@ -72,6 +72,11 @@ uses `uv` / `poetry` / a venv, run the commands through it.
   common height: the first tower's output on top runs down a channel between the towers to wherever it is
   used in the second, so nothing is left empty under a shorter tower. Flows leave the earlier phase's right
   border and enter the later one's left border; several of them are ordered to avoid crossing each other.
+  A tensor that only travels to another phase also leaves / enters the blocks it sits in through their side
+  border at the height of its producer / consumer, instead of looping over the block's top / bottom.
+- Rows, track levels and shared trunks are ordered to minimise crossings (barycentre + sifting passes); a
+  trunk stays on one vertical line where it can, and two ports a hair apart on one flow become one straight
+  line, not a double bend.
 - Flows are identified by their *producer*: K and V from one projector are two lines; give each its own
   `label(...)`.
 
@@ -85,8 +90,8 @@ For several entry points or persistent state (stored K/V, KV cache, encoder/deco
 `run(model)` and wrap each call in `phase(...)`, or open `phase(...)` inside a `forward()` to split one pass
 into regions (encoder | decoder). Name tensors with `label(...)`. A phase counts as one `--depth` level;
 when the root module is dissolved (as it is with phases) the phases are level 0, so `--depth 1` is the
-overview with the blocks closed. A graph input is drawn inside the phase that reads it (the first one, if
-several do) and a flow carries it to the others. Tensors kept on the model between calls keep their origin, so the arrow between
+overview with the blocks closed. A graph input read by several phases is drawn once inside each of them
+(a copy per phase, so no long line has to cross the sheet). Tensors kept on the model between calls keep their origin, so the arrow between
 phases is drawn automatically:
 
 ```python
