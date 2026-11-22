@@ -86,6 +86,9 @@ def clip(text, n):
 
 
 # ---------------------------------------------------------------- layout
+EQUALIZE_PHASE_LINKS = False      # True: shift phases until every cross-phase flow is one straight line (leaves gaps)
+
+
 class Layout:
     def __init__(self, graph, theme="light", card_io=True, edge_labels=True, edge_shapes=False):
         self.g, self.sym = graph, graph.sym
@@ -225,7 +228,7 @@ class Layout:
         pad = 0 if n.kind == "scene" else 12
         n._layout_args = (items, header_h, header_w, pad)
         self.layout_items(n, items, header_h, header_w, pad)
-        if n.kind == "scene":
+        if n.kind == "scene" and EQUALIZE_PHASE_LINKS:
             self.equalize_phase_links(n)
 
     def equalize_phase_links(self, scene):

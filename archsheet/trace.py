@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import inspect
 import itertools
+import os
 from collections import namedtuple
 from functools import partial
 
@@ -41,6 +42,8 @@ KEY_OPS = {
     "sigmoid", "tanh", "softplus", "conv1d", "conv2d", "conv3d", "conv_transpose1d",
     "conv_transpose2d", "max_pool2d", "avg_pool2d", "adaptive_avg_pool2d", "interpolate",
     "cross_entropy", "mse_loss", "sort", "argmax", "cumsum", "pad",
+    "avg_pool1d", "avg_pool2d", "avg_pool3d", "max_pool1d", "max_pool3d", "adaptive_avg_pool1d",
+    "adaptive_max_pool1d", "adaptive_max_pool2d", "mean", "sum", "amax", "amin", "logsumexp",
 }
 ALIASES = {
     "radd": "add", "iadd": "add", "rmul": "mul", "imul": "mul", "rsub": "sub",
@@ -134,6 +137,7 @@ class Node:
         self.params = 0
         self.attrs = {}
         self.leaf = False
+        self.is_method = False
         self.repeat = 1
         self.note = ""
         # filled by archsheet.graph
@@ -194,10 +198,10 @@ def pretty_extra(m: nn.Module) -> str:
     return r if len(r) <= 70 else r[:67] + "…"
 
 
-def named_inputs(module, args, kwargs):
-    """[(forward-parameter name, tensor)] for a module call."""
+def named_inputs(module, args, kwargs, fn=None):
+    """[(forward-parameter name, tensor)] for a module call (or for a traced method `fn`)."""
     try:
-        sig = inspect.signature(module.forward)
+        sig = inspect.signature(fn or module.forward)
         bound = sig.bind_partial(*args, **kwargs)
         items = []
         for pname, val in bound.arguments.items():
@@ -227,9 +231,11 @@ def scalar_attrs(m: nn.Module) -> dict:
 
 
 class Tracer(TorchFunctionMode):
-    def __init__(self, root: nn.Module, ops="key", hide_types=(), leaf_types=()):
+    def __init__(self, root: nn.Module, ops="key", hide_types=(), leaf_types=(), methods=()):
         super().__init__()
         self.root = root
+        self.methods = [m.strip() for m in methods if m.strip()]
+        self._patched = []
         self.ops = ops
         self.hide = set(hide_types)
         self.leaf_types = set(leaf_types)
@@ -252,7 +258,62 @@ class Tracer(TorchFunctionMode):
         for name, m in self.root.named_modules():
             self._handles.append(m.register_forward_pre_hook(partial(self._pre, name), with_kwargs=True))
             self._handles.append(m.register_forward_hook(partial(self._post, name), with_kwargs=True))
+        self._patch_methods()
         return self
+
+    def _call_site(self, depth=2):
+        """File:line of the code that called a traced method / function. Repeats of one call site (a loop)
+        are one box; two different call sites are two boxes."""
+        import sys
+        f = sys._getframe(depth)
+        return f"{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}"
+
+    def _wrap(self, orig, path, owner, name):
+        def wrapper(*a, **k):
+            if self.paused:
+                return orig(*a, **k)
+            p = f"{path}@{self._call_site()}"
+            self._pre(p, owner, a, k, method=(name, orig))
+            out = orig(*a, **k)
+            self._post(p, owner, a, k, out)
+            return out
+        wrapper.__wrapped__ = orig
+        return wrapper
+
+    def _patch_methods(self):
+        """`Class.method` or `package.module:function` entries: a plain method or function that does real work
+        (a pooling step, hyper-connection mixing, rotary embedding) is drawn like a module call. The model is not
+        touched: the callable is wrapped while tracing and restored afterwards."""
+        import importlib
+        import sys
+        for spec in self.methods:
+            hit = False
+            if ":" in spec:
+                modname, _, fn = spec.partition(":")
+                mod = sys.modules.get(modname)
+                if mod is None:
+                    try:
+                        mod = importlib.import_module(modname)
+                    except Exception:
+                        mod = None
+                if mod is not None and callable(getattr(mod, fn, None)):
+                    hit = True
+                    orig = getattr(mod, fn)
+                    self._patched.append((mod, fn, True, orig))
+                    setattr(mod, fn, self._wrap(orig, fn, None, fn))
+            else:
+                cls, _, meth = spec.partition(".")
+                for name, m in self.root.named_modules():
+                    if cls not in {c.__name__ for c in type(m).__mro__} or not callable(getattr(m, meth, None)):
+                        continue                         # a subclass of Cls matches too
+                    hit = True
+                    orig = getattr(m, meth)
+                    had = meth in vars(m)
+                    self._patched.append((m, meth, had, vars(m).get(meth)))
+                    object.__setattr__(m, meth, self._wrap(orig, f"{name}.{meth}" if name else meth, m, meth))
+            if not hit:
+                print(f"! --trace-methods {spec}: nothing to trace (expected Class.method or module:function)",
+                      file=sys.stderr)
 
     def remove(self):
         global ACTIVE
@@ -260,6 +321,15 @@ class Tracer(TorchFunctionMode):
         for h in self._handles:
             h.remove()
         self._handles = []
+        for m, meth, had, old in reversed(self._patched):
+            if isinstance(m, nn.Module):
+                if had:
+                    object.__setattr__(m, meth, old)
+                else:
+                    vars(m).pop(meth, None)
+            else:
+                setattr(m, meth, old)
+        self._patched = []
 
     # ------------------------------------------------------------ helpers
     def _is_leaf(self, m):
@@ -305,10 +375,11 @@ class Tracer(TorchFunctionMode):
             self.labels[(p[0].id, p[1])] = text
 
     # ------------------------------------------------------------ module hooks
-    def _pre(self, path, module, args, kwargs):
+    def _pre(self, path, module, args, kwargs, method=None):
         self.paused += 1
         try:
-            tname = type(module).__name__
+            tname = (type(module).__name__ if method is None else
+                     f"{type(module).__name__}.{method[0]}" if module is not None else method[0])
             if self.leaf_depth or tname in self.hide:
                 self.calls.append(("skip", args, kwargs))
                 self.leaf_depth += 1
@@ -316,19 +387,26 @@ class Tracer(TorchFunctionMode):
             first = not self.stack
             top = self.cur_top
             if first:
-                self._make_inputs(top, module, args, kwargs)
-            node = Node("module", path.rsplit(".", 1)[-1] if path else tname, tname, path)
-            node.leaf = self._is_leaf(module)
-            node.extra = pretty_extra(module)
-            node.attrs = scalar_attrs(module)
-            node.params = sum(p.numel() for p in module.parameters())
-            named = named_inputs(module, args, kwargs)
+                self._make_inputs(top, module, args, kwargs, method[1] if method else None)
+            node = Node("module", method[0] if method else path.rsplit(".", 1)[-1] if path else tname, tname, path)
+            if method is None:
+                node.leaf = self._is_leaf(module)
+                node.extra = pretty_extra(module)
+                node.attrs = scalar_attrs(module)
+                node.params = sum(p.numel() for p in module.parameters())
+                named = named_inputs(module, args, kwargs)
+            else:                                    # a traced method / function: a box (see _post for containers)
+                node.leaf = tname in self.leaf_types
+                node.is_method = True
+                node.extra = "function" if module is None else "method"
+                named = [(n_, t) for n_, t in named_inputs(module, args, kwargs, method[1])
+                         if not isinstance(t, nn.Parameter)]
             node.in_names = [nm for nm, _ in named]
             node.in_metas = [meta(t) for _, t in named]
             parent = top if first else self._parent()
             node.parent = parent
             parent.children.append(node)
-            if first and self.root_node is None:
+            if first and self.root_node is None and method is None:
                 self.root_node = node
             if node.leaf:
                 self._consume(node, list(iter_tensors((args, kwargs))))
@@ -357,6 +435,8 @@ class Tracer(TorchFunctionMode):
                 self.leaf_depth -= 1
             outs = list(iter_tensors(out))
             node.out_metas = [meta(t) for t in outs]
+            if node.is_method and not node.leaf and not any(c.kind == "module" for c in node.children):
+                self._collapse_method(node)
             if node.leaf:
                 for t in outs:
                     self._set_prov(t, node, meta(t))
@@ -365,9 +445,28 @@ class Tracer(TorchFunctionMode):
         finally:
             self.paused -= 1
 
-    def _make_inputs(self, top, module, args, kwargs):
+    def _collapse_method(self, node):
+        """A traced method that called no module is a single box: the ops it ran inside are folded into it, so
+        what flows out of it starts at the box."""
+        inner = set()
+
+        def walk(n):
+            for c in n.children:
+                inner.add(c.id)
+                walk(c)
+        walk(node)
+        self.edges = [e for e in self.edges if not (e.src.id in inner and e.dst.id in inner)]
+        for e in self.edges:
+            if e.dst.id in inner:
+                e.dst = node
+        for k, (pn, pm, ops, trail) in list(self.prov.items()):
+            if pn.id in inner:
+                self.prov[k] = (node, pm, (), ())
+        node.children, node.leaf = [], True
+
+    def _make_inputs(self, top, module, args, kwargs, fn=None):
         try:
-            params = [p for p in inspect.signature(module.forward).parameters]
+            params = [p for p in inspect.signature(fn or module.forward).parameters]
         except (TypeError, ValueError):
             params = []
         items = []
@@ -397,9 +496,10 @@ class Tracer(TorchFunctionMode):
             if n.kind != "input":
                 continue
             ph = {id(self._phase_of_node(e.dst)): self._phase_of_node(e.dst) for e in self.edges if e.src is n}
-            if len(ph) == 1:
-                p = next(iter(ph.values()))
-                if p is not None and p is not n.parent:
+            if ph and None not in ph.values():
+                # read by several phases: it lives in the first one, the others get a flow from there
+                p = min(ph.values(), key=lambda q: q.id)
+                if p is not n.parent:
                     self.scene.children.remove(n)
                     n.parent = p
                     p.children.insert(0, n)
@@ -422,6 +522,12 @@ class Tracer(TorchFunctionMode):
                 self._consume(n, [t])
 
     # ------------------------------------------------------------ functional ops
+    @staticmethod
+    def _outside_ops_ok(args, kwargs):
+        """An op outside the model on tensors we have never seen: only a tensor that is passed in counts
+        (creation helpers like torch.zeros(...) have no tensor argument)."""
+        return any(isinstance(t, torch.Tensor) for t in iter_tensors((args, kwargs)))
+
     def _should_show(self, name, nsrc):
         if name in SHAPE_OPS or self.ops == "none":
             return False
@@ -429,14 +535,50 @@ class Tracer(TorchFunctionMode):
             return True
         return self.ops == "key" and name in KEY_OPS
 
+    def _input_name(self, t):
+        """Name an untracked tensor after the variable that holds it in the user's code (a parameter of the
+        method that is being traced, or a local of run())."""
+        import sys
+        here = (__file__, os.path.dirname(torch.__file__))
+        f = sys._getframe(1)
+        while f is not None:
+            fn = f.f_code.co_filename
+            if not fn.startswith(here[1]) and fn != here[0] and "contextlib" not in fn:
+                for k, v in f.f_locals.items():
+                    if v is t:
+                        return k
+                break
+            f = f.f_back
+        return "input"
+
+    def _adopt_inputs(self, tensors, host):
+        """Outside every module a tensor with no history that an op reads is a graph input of the spec."""
+        for t in tensors:
+            if id(t) in self.prov or isinstance(t, nn.Parameter) or t.dim() == 0:
+                continue
+            n = Node("input", self._input_name(t), "input")
+            n.parent = host
+            n.out_metas = [meta(t)]
+            host.children.append(n)
+            self._set_prov(t, n, meta(t))
+
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         out = func(*args, **kwargs)
-        if self.paused or self.leaf_depth or not self.stack:
+        if self.paused or self.leaf_depth:
             return out
         outs = list(iter_tensors(out))
         if not outs:
             return out
+        host = self._parent() if self.stack else self.cur_top      # no module running: the spec's own code
+        if not self.stack:
+            if not any(id(t) in self.prov for t in iter_tensors((args, kwargs))) and not self._outside_ops_ok(args, kwargs):
+                return out
+            self.paused += 1
+            try:
+                self._adopt_inputs([t for t in iter_tensors((args, kwargs)) if id(t) not in self.prov], host)
+            finally:
+                self.paused -= 1
         ins = [t for t in iter_tensors((args, kwargs)) if id(t) in self.prov]
         if not ins:
             return out                      # constant / creation op: nothing flows in
@@ -445,9 +587,9 @@ class Tracer(TorchFunctionMode):
         for t in ins:
             p = self.prov[id(t)]
             srcs.setdefault(p[0].id, p)
-        if self._should_show(name, len(srcs)):
+        if self._should_show(name, len(srcs)) or (not self.stack and name not in SHAPE_OPS and self.ops != "none"):
             node = Node("op", name, name)
-            node.parent = self._parent()
+            node.parent = host
             node.parent.children.append(node)
             node.in_metas = [meta(t) for t in ins]
             node.out_metas = [meta(t) for t in outs]
@@ -465,7 +607,7 @@ class Tracer(TorchFunctionMode):
         else:
             n0, m0, ops0, tr0 = next(iter(srcs.values()))
             for t in outs:
-                self._set_prov(t, n0, m0, ops0 + (name,), tr0 + ((self.stack[-1], meta(t), name),))
+                self._set_prov(t, n0, m0, ops0 + (name,), tr0 + ((host, meta(t), name),))
         return out
 
 

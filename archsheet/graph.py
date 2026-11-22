@@ -172,10 +172,13 @@ class Graph:
             if e.key() not in seen:
                 seen.add(e.key())
                 self.edges.append(e)
+        self._prepass(self.scene)
+        self._dedupe_outputs()
         self._build_display(self.scene, collapse)
         self._assign(self.scene, 0)
         self._mark(self.scene, None)
         self.segments = defaultdict(list)
+        self._dropped = self._acyclic()
         self._lift()
         if node_ann:
             self._attach_annotations()
@@ -196,16 +199,129 @@ class Graph:
         return out
 
     # ---------------------------------------------------------- repeat collapse
+    # ---------------------------------------------------------- one module called several times
+    def _merge_into(self, rep, other):
+        """`other` is a later call of the same module as `rep`: draw it once. Sub-calls are matched by path (and by
+        order among equal paths); a sub-call that only `other` made becomes a child of `rep`."""
+        self.alias[other.id] = rep
+        pool = defaultdict(list)
+        for c in rep.children:
+            pool[(c.kind, c.path or c.name)].append(c)
+        seen = defaultdict(int)
+        for c in list(other.children):
+            key = (c.kind, c.path or c.name)
+            i = seen[key]
+            seen[key] += 1
+            if i < len(pool[key]):
+                self._merge_into(pool[key][i], c)
+            else:
+                c.parent = rep
+                rep.children.append(c)
+                pool[key].append(c)
+
+    def _prepass(self, node):
+        """Walk the whole call tree and draw every module that was called several times once."""
+        if node.kind not in ("scene", "module", "phase"):
+            return
+        node.children = self._merge_calls(node)
+        for c in node.children:
+            self._prepass(c)
+
+    def _dedupe_outputs(self):
+        """Result nodes of calls that were merged into one box: the same producer, name and shape is one output."""
+        prod = defaultdict(set)
+        for e in self.edges:
+            if e.dst.kind == "output":
+                prod[e.dst.id].add((self.resolve(e.src).id, e.mfrom))
+
+        def walk(n):
+            seen, keep = {}, []
+            for c in n.children:
+                if c.kind == "output":
+                    k = (c.name, tuple(c.in_metas), tuple(sorted(prod.get(c.id, ()))))
+                    if k in seen and prod.get(c.id):
+                        self.alias[c.id] = seen[k]
+                        continue
+                    seen[k] = c
+                keep.append(c)
+            n.children = keep
+            for c in keep:
+                if c.kind in ("module", "phase"):
+                    walk(c)
+        walk(self.scene)
+
+    def _merge_calls(self, node):
+        """Children of `node` that are calls of one module (same path): keep the first, alias the others."""
+        first, calls, merged = {}, defaultdict(list), {}
+        out = []
+        for c in node.children:
+            if c.kind != "module" or not c.path:
+                out.append(c)
+                continue
+            rep = first.setdefault((c.path, c.type), c)
+            if rep is c:
+                out.append(c)
+            else:
+                calls[rep.id].append(c)
+        for c in list(out):
+            # a block passed through again (chunks, weight sharing) is drawn once; a small module used 2x in a
+            # pipeline (pre/post mixing around attention and ffn) keeps its two boxes, 3+ calls are noise
+            if c.id in calls and (not c.leaf or len(calls[c.id]) >= 2):
+                merged[c.id] = 1 + len(calls[c.id])
+                for o in calls.pop(c.id):
+                    self._merge_into(c, o)
+        for later in calls.values():
+            out.extend(later)
+        out.sort(key=lambda c: c.seq)
+        for c in out:
+            n = merged.get(c.id)
+            if n:
+                c.repeat = n
+                c.note = " · ".join([x for x in (c.note, f"{n} calls") if x])
+        return out
+
+    def _acyclic(self):
+        """Edges that are not drawn because they would close a loop in the drawn graph: a module that is called
+        several times (or a layer drawn once for N) feeds its own next call. The box says `×N`; only the first
+        call's wiring is kept. Edges are admitted in execution order, so a later call's input that is computed
+        from the earlier calls is the one that goes."""
+        adj = defaultdict(set)
+        pending = []
+        for e in self.edges:
+            if self._cross_iteration(e.src, e.dst):
+                continue
+            u, v = self.resolve(e.src), self.resolve(e.dst)
+            if u is v:
+                continue
+            if u is e.src and v is e.dst:
+                adj[u.id].add(v.id)
+            else:
+                pending.append((e, u, v))
+        drop = set()
+        for e, u, v in pending:
+            seen, todo = {v.id}, [v.id]
+            while todo and u.id not in seen:
+                for j in adj.get(todo.pop(), ()):
+                    if j not in seen:
+                        seen.add(j)
+                        todo.append(j)
+            if u.id in seen:
+                drop.add(id(e))
+            else:
+                adj[u.id].add(v.id)
+        return drop
+
     def _display_children(self, node, collapse):
         groups = OrderedDict()
+        kids = node.children
         if collapse:
-            for c in node.children:
+            for c in kids:
                 m = _IDX.match(c.path) if c.kind == "module" else None
                 if m and c.name.isdigit():
                     groups.setdefault(m.group(1), []).append(c)
         in_group = {c.id: k for k, ms in groups.items() if len(ms) > 1 for c in ms}
         dch, done = [], set()
-        for c in node.children:
+        for c in kids:
             k = in_group.get(c.id)
             if k is None:
                 dch.append(c)
@@ -436,7 +552,7 @@ class Graph:
 
     def _lift(self):
         for e in self.edges:
-            if self._cross_iteration(e.src, e.dst):
+            if id(e) in self._dropped or self._cross_iteration(e.src, e.dst):
                 continue
             u, v = self.resolve(e.src), self.resolve(e.dst)
             if u.disp is None or v.disp is None:

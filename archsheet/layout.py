@@ -17,7 +17,8 @@ Pipeline
                    TOP_CLEAR / BOT_CLEAR away from the nodes so corners never touch arrowheads
   6. routing       polylines ("pieces"); residuals into `+` enter from the right side
 Phases (dashed regions of a multi-entry model) are placed side by side; flows between them leave and
-enter through side borders. Renderer.equalize_phase_links makes both ends of such a flow equally high.
+enter through side borders; a flow whose two ends are at different heights runs down (or up) the channel
+between the two phases, so towers of different height sit bottom-aligned with no gap under the shorter one.
 """
 from __future__ import annotations
 
@@ -73,6 +74,40 @@ def _pav(nodes, des, wt, gap):
         z += [b[0] / b[1]] * b[2]
     for v, zi, si in zip(nodes, z, S):
         v.lx = zi + si
+
+
+def _channel_order(grp):
+    """Flows from one phase to the next that end at a different height run down (or up) the channel between the
+    two. Each gets its own vertical; the order of the verticals that has the fewest crossings wins (all flows
+    going down: the one starting highest takes the outer vertical, going up: the one starting lowest)."""
+    from itertools import permutations
+    sx = grp[0].src.x + grp[0].src.w
+    ex = grp[0].dst.x
+    rows = [(g.src.y + g.src_tag.y, g.dst.y + g.dst_tag.y, g) for g in grp]
+    bent = [r for r in rows if abs(r[0] - r[1]) > 0.5]
+    out = {}
+    if not bent:
+        return out
+    k = len(bent)
+    xs = [sx + (ex - sx) * (i + 1) / (k + 1) for i in range(k)]
+
+    def crossings(order):                       # order[i] = flow using the i-th vertical from the left
+        hs, vs = [], []
+        for x, (a, b, _g) in zip(xs, order):
+            hs += [(a, sx, x), (b, x, ex)]       # horizontals: (y, x0, x1)
+            vs.append((x, min(a, b), max(a, b)))
+        c = 0
+        for y, x0, x1 in hs:
+            for x, y0, y1 in vs:
+                if x0 < x < x1 and y0 < y < y1:
+                    c += 1
+        return c
+
+    cand = permutations(bent) if k <= 6 else [sorted(bent, key=lambda r: r[0]), sorted(bent, key=lambda r: -r[0])]
+    best = min(cand, key=lambda o: (crossings(o), sum(abs(a - b) * abs(i - (k - 1) / 2) for i, (a, b, _g) in enumerate(o))))
+    for x, (_a, _b, g) in zip(xs, best):
+        out[id(g)] = x
+    return out
 
 
 def layout_items(L, n, items, header_h, header_w, pad):
@@ -729,6 +764,17 @@ def layout_items(L, n, items, header_h, header_w, pad):
             p.to.y = track_y.get(id(p), 0)
     n.pieces, n.labels = [], []
     side_count = defaultdict(int)
+    JOG = 14.0                    # two ports closer than this on one flow get one straight line, not a double bend
+
+    def snap_x(p, f, t, sx, ex):
+        """Common x for a Z-shaped piece whose ends are nearly aligned, or None if neither end can move."""
+        if t.id not in tout and t.kind != "dummy" and t.x + 5 < sx < t.x + t.w - 5 and all(
+                abs(t.x + o - sx) > 6 for (tid, pid), o in in_off.items() if tid == t.id and pid != id(p)):
+            return sx
+        if f.id not in tin and f.kind != "dummy" and f.x + 5 < ex < f.x + f.w - 5 and all(
+                abs(f.x + o - ex) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
+            return ex
+        return None
     for p in pieces.values():
         f, t = p.frm, p.to
         arrow = any(s.dst is t and s.dst.kind != "tag" and s.dst_tag is None for s in p.finals)
@@ -769,6 +815,14 @@ def layout_items(L, n, items, header_h, header_w, pad):
         elif 0.5 < abs(sx - ex) < 3.0 and (f.kind == "dummy" or t.kind == "dummy"):
             x = ex if f.kind == "dummy" else sx           # a trunk that is a hair off its port: follow the real end
             pts = [(x, sy), (x, ey)]
+        elif 0.5 < abs(sx - ex) < JOG and (f.kind == "dummy" or t.kind == "dummy" or snap_x(p, f, t, sx, ex) is not None):
+            if f.kind == "dummy":
+                x = ex
+            elif t.kind == "dummy":
+                x = sx
+            else:
+                x = snap_x(p, f, t, sx, ex)
+            pts = [(x, sy), (x, ey)]                     # a hair off: one straight line instead of a double bend
         elif abs(sx - ex) > 0.5:
             pts = [(sx, sy), (sx, ty), (ex, ty), (ex, ey)]
         else:
@@ -794,12 +848,18 @@ def layout_items(L, n, items, header_h, header_w, pad):
     if phases_mode:
         lat_segs = [s for s in segs if lateral(s) and s.src_tag is not None and s.dst_tag is not None]
         lat_segs.sort(key=lambda s: (s.src.x, s.src_tag.y))
+        mids = {}
+        by_pair = defaultdict(list)
+        for s in lat_segs:
+            by_pair[(s.src.id, s.dst.id)].append(s)
+        for grp in by_pair.values():
+            mids.update(_channel_order(grp))
         for i, s in enumerate(lat_segs):
             P1, P2 = s.src, s.dst
             sx, sy = P1.x + P1.w, P1.y + s.src_tag.y
             ex, ey = P2.x, P2.y + s.dst_tag.y
-            straight = abs(sy - ey) <= 0.5          # equalised by Renderer.size_container: normally a single line
-            mid = (sx + ex) / 2 if straight else sx + (ex - sx) * (i + 1) / (len(lat_segs) + 1)
+            straight = abs(sy - ey) <= 0.5          # both ends equally high: a single line
+            mid = (sx + ex) / 2 if straight else mids[id(s)]
             pts = [(sx, sy), (ex, ey)] if straight else [(sx, sy), (mid, sy), (mid, ey), (ex, ey)]
             n.pieces.append(dict(pts=pts, arrow=False, shape=s.mfrom, fid=s.fid))
             lines = s.glines + s.alines

@@ -14,7 +14,7 @@ seconds. Output is SVG, a pan/zoom HTML page (hover for exact numeric shapes) an
 | <a href="examples/output/deepseek_overview.png"><img src="examples/output/deepseek_overview.png" width="260"></a> | <a href="examples/output/deepseek_csa2_modes.png"><img src="examples/output/deepseek_csa2_modes.png" width="260"></a> | |
 | **DeepSeek-V4.1-Flash**<br>causal encoder / decoder, Engram, mHC, DSpark (paper fig. 3) | **CSA2 modes**<br>Full / Reindex / Reuse attention (paper fig. 4) | |
 
-Click a picture for the full-size PNG; every example also has a `*_detail` view (`--depth 4`) and
+Click a picture for the full-size PNG; the first three examples also have a `*_detail` view (`--depth 4`) and
 `.svg` / `.html` versions in [`examples/output/`](examples/output). See [`examples/`](examples) for the
 specs behind them.
 
@@ -54,6 +54,7 @@ Useful flags (all of them are listed in [`SKILL.md`](SKILL.md)):
 | `--ops none\|merge\|key\|all` | which functional ops are drawn as nodes |
 | `--theme light\|blueprint` | white diagram, or a dark-blue engineering-drawing style |
 | `--no-collapse` | draw every repeated layer instead of `×N` |
+| `--trace-methods A.m,pkg.mod:f` | draw a plain method / function (not a module) as a box |
 | `--png-width PX` | PNG width in pixels (default: 2× the SVG, never more than 16000 px on a side) |
 | `--hide-skips` | leave out residual skip lines; everything else stays exactly where it was |
 

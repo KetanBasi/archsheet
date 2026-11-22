@@ -8,7 +8,7 @@ for n in gemma_like vlm two_phase; do
   python -m archsheet examples/${n}_spec.py -o examples/output/${n}_overview --depth 2 --png
   python -m archsheet examples/${n}_spec.py -o examples/output/${n}_detail   --depth 4 --png
 done
-python -m archsheet examples/deepseek_v41_flash_spec.py -o examples/output/deepseek_overview --depth 2 --png
+python -m archsheet examples/deepseek_v41_flash_spec.py -o examples/output/deepseek_overview --depth 1 --png
 python -m archsheet examples/deepseek_csa2_modes_spec.py -o examples/output/deepseek_csa2_modes --png
 ```
 
@@ -26,8 +26,9 @@ pattern (`12 layers = 2 × pattern of 6`); the two layer variants differ only in
 ## `vlm_spec.py` — vision tower → projector → language model
 
 The image branch is merged into the text branch at the input-embedding level
-(`inputs_embeds.masked_scatter(mask, image_features)`). The text path stays one straight column, the
-vision branch comes in from the left, and the `<image>` mask path runs up the right.
+(`inputs_embeds.masked_scatter(mask, image_features)`). The forward opens two `phase(...)` blocks, `Vision` and
+`Language`, side by side: the projector output at the top of the vision tower runs down the channel between
+them to the merge point, so there is no long line from `input_ids` across the sheet.
 
 <a href="output/vlm_overview.png"><img src="output/vlm_overview.png" width="360"></a>
 
@@ -62,28 +63,39 @@ first layer, and the DSpark draft head on top.
 
 [overview HTML](output/deepseek_overview.html) · [overview SVG](output/deepseek_overview.svg)
 
-The released `inference/model.py` cannot be traced as is (custom fp8/fp4 kernels, KV caches in buffers,
-`.tolist()` in the expert router), so the spec is a **structural stand-in** with the released module names,
-shapes and config (hidden 5120, 64 heads × 512, 384 routed experts / top-6, mHC with 4 streams). What it
-replaces by plain torch ops is listed in the spec's docstring. Differences from the figure, on purpose:
+The model is **not a stand-in**: [`deepseek_v41_flash/`](deepseek_v41_flash) is the released
+`inference/model.py` adapted for training (MIT, see its `LICENSE`; the table at the top of `model.py` lists
+every change: no caches or `start_pos`, plain torch instead of the fp8/fp4 and TileLang kernels, stacked
+experts with `F.grouped_mm` instead of `.tolist()`, teacher-forced DSpark, one `masked_scatter` for the
+image merge). It runs forward and backward, and at the released shapes it builds on the `meta` device
+(763 B parameters). The spec only picks what to draw: two `phase(...)` blocks in a subclass's `forward`, and
+
+```python
+FLAGS = dict(trace_methods="Block.hc_mixes,Block.hc_pre,Block.hc_post,deepseek_v41_flash.model:sparse_attention")
+```
+
+so that the hyper-connection helpers (plain methods) and the sparse-attention function (a plain function)
+get their own boxes without touching the model. The sheet is `--depth 1`: blocks closed. `--depth 2` opens
+every block (about 800 edges, a 16000 px tall PNG) and is meant for zooming in the SVG / HTML.
+
+Differences from the figure, on purpose:
 
 - Layers 1 and 14 carry an Engram gate, so they are drawn as their own boxes instead of being folded into
   the `×N` patterns (the figure leaves that out).
-- The token-modality mask is a model buffer, not a graph input; drawing it would add a line to every MoE.
-- `512` is both the head dim and the top-k, so both are written `dh`.
-- At `--depth 3`/`4` the whole model is too dense to read (≈ 50–90 crossings); use the per-mode sheet below
-  for the attention internals.
+- The token-modality mask and the Engram n-gram hashes are model inputs here, so they are lines on the sheet.
+- Indexer parameters get no gradient from the language-model loss (top-k selection is not differentiable);
+  training them needs the separate indexer loss, which is not part of this model.
 
 ## `deepseek_csa2_modes_spec.py` — CSA2 Full / Reindex / Reuse
 
-Reproduces figure 4 of the same paper: one layer per mode, with the boxes of the figure (`main_q`,
-`swa_kv`, `main_kv`, `indexer_k`, `indexer_q`, `indexer`, `selection`, `concatenation`, `core_attention`)
-and the reused tensors (`main_kv_cache`, `indexer_k_cache`, `topk_cache`) entering from the earlier mode.
+Reproduces figure 4 of the same paper from the real `Attention` modules of layers 20 (Full), 24 (Reindex)
+and 25 (Reuse): the Full layer has a `compressor` and an `indexer`, Reindex only an `indexer`, Reuse neither,
+and the lines leaving one region and entering a later one are the shared Main KV, Indexer K and Top-K
+indices. `rotate_tail` and `sparse_attention` are drawn as boxes with `trace_methods`.
 
 <a href="output/deepseek_csa2_modes.png"><img src="output/deepseek_csa2_modes.png" width="360"></a>
 
 [HTML](output/deepseek_csa2_modes.html) · [SVG](output/deepseek_csa2_modes.svg)
 
 Not reproduced: the paper's figure 5 (hierarchical sparse indexer) is an illustration of selected
-positions and blocks, not a dataflow graph. The three regions are drawn as a staircase rather than level
-with each other because the layout raises a phase to the height of the tensors it consumes.
+positions and blocks, not a dataflow graph.

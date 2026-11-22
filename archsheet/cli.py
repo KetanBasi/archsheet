@@ -70,6 +70,8 @@ def main(argv=None):
     ap.add_argument("--no-collapse", action="store_true", help="draw every repeated layer")
     ap.add_argument("--hide-types", default="Identity,Dropout", help="module class names to treat as pass-through")
     ap.add_argument("--leaf-types", default="", help="module class names to draw as one box (no expansion)")
+    ap.add_argument("--trace-methods", default="", metavar="Cls.meth,...",
+                    help="draw these plain methods as boxes (e.g. Block.hc_pre,Attention.tree_write)")
     ap.add_argument("--unwrap", default="", help="module class names to dissolve (children drawn in their place)")
     ap.add_argument("--device", default="meta", help="meta (default) or cpu (if the model needs real values)")
     ap.add_argument("--dtypes", choices=["auto", "all", "none"], default="auto")
@@ -103,7 +105,8 @@ def main(argv=None):
 
     tracer = Tracer(model, ops=a.ops,
                     hide_types=[s for s in a.hide_types.split(",") if s],
-                    leaf_types=[s for s in a.leaf_types.split(",") if s]).install()
+                    leaf_types=[s for s in a.leaf_types.split(",") if s],
+                    methods=a.trace_methods.split(",")).install()
     try:
         with torch.no_grad(), torch.device(dev), meta_autocast_noop(), tracer:
             run = cfg.get("run")
@@ -126,7 +129,7 @@ def main(argv=None):
     lay = Layout(g, a.theme, card_io=not a.no_card_io, edge_labels=not a.no_edge_labels,
                  edge_shapes=a.edge_shapes)
     lay.size(g.scene)
-    title = a.title or cfg.get("title") or tracer.root_node.type
+    title = a.title or cfg.get("title") or (tracer.root_node.type if tracer.root_node is not None else type(model).__name__)
     svg = Renderer(lay, title, a.theme).svg()
 
     out = a.out

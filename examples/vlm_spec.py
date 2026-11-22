@@ -8,6 +8,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from archsheet import phase
+
 B, S, HW = 5, 23, 42                 # batch, text length (incl. image tokens), image size
 P = 14                               # patch size
 N = (HW // P) ** 2                   # image patches = image tokens = 9
@@ -112,11 +114,13 @@ class TinyVLM(nn.Module):
         self.lm_head = nn.Linear(D, V, bias=False)
 
     def forward(self, input_ids, pixel_values):
-        image_features = self.multi_modal_projector(self.vision_tower(pixel_values))   # [b, n, d]
-        inputs_embeds = self.embed_tokens(input_ids)                                    # [b, s, d]
-        mask = (input_ids == IMG_TOKEN).unsqueeze(-1).expand_as(inputs_embeds)
-        inputs_embeds = inputs_embeds.masked_scatter(mask, image_features)             # <- branch-in
-        return self.lm_head(self.language_model(inputs_embeds))
+        with phase("Vision"):
+            image_features = self.multi_modal_projector(self.vision_tower(pixel_values))   # [b, n, d]
+        with phase("Language"):
+            inputs_embeds = self.embed_tokens(input_ids)                                    # [b, s, d]
+            mask = (input_ids == IMG_TOKEN).unsqueeze(-1).expand_as(inputs_embeds)
+            inputs_embeds = inputs_embeds.masked_scatter(mask, image_features)             # <- branch-in
+            return self.lm_head(self.language_model(inputs_embeds))
 
 
 def build():
