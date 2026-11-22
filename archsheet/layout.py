@@ -432,6 +432,78 @@ def layout_items(L, n, items, header_h, header_w, pad):
                         changed = True
             if not changed:
                 break
+        def column_of(v):
+            """v plus the nodes above / below it that it is the only neighbour of (a chain that moves as one)"""
+            col = [v]
+            x = v
+            while len(up[id(x)]) == 1 and hasattr(up[id(x)][0], "kind") and len(down[id(up[id(x)][0])]) == 1:
+                x = up[id(x)][0]
+                col.append(x)
+            x = v
+            while len(down[id(x)]) == 1 and hasattr(down[id(x)][0], "kind") and len(up[id(down[id(x)][0])]) == 1:
+                x = down[id(x)][0]
+                col.insert(0, x)
+            return col
+
+        def total():
+            t = 0
+            for nodes in layers.values():
+                es = [(pos[id(v)], pos[id(w)]) for v in nodes for w in up[id(v)]]
+                for i, (a, b) in enumerate(es):
+                    for c, d in es[i + 1:]:
+                        if (a - c) * (b - d) < 0:
+                            t += 1
+            return t
+
+        def swap_columns():
+            """Sifting moves one node at a time, so it cannot move a chain (norm -> head) past a trunk: every
+            single step adds a crossing before the last one removes two. Swap whole chains instead."""
+            row_of = {id(v): l for l, ls in layers.items() for v in ls}
+            cur = total()
+            for _ in range(6):
+                improved = False
+                for l in sorted(layers):
+                    nodes = layers[l]
+                    if any(v.kind == "phase" for v in nodes):
+                        continue
+                    for i in range(len(nodes) - 1):
+                        a, b = nodes[i], nodes[i + 1]
+                        ca, cb = column_of(a), column_of(b)
+                        if len(ca) + len(cb) < 3 or {id(v) for v in ca} & {id(v) for v in cb}:
+                            continue
+                        rows = {}
+                        ok, orient = True, None
+                        for r in {row_of[id(v)] for v in ca} & {row_of[id(v)] for v in cb}:
+                            xa = next(v for v in ca if row_of[id(v)] == r)
+                            xb = next(v for v in cb if row_of[id(v)] == r)
+                            ls = layers[r]
+                            ia, ib = ls.index(xa), ls.index(xb)
+                            if abs(ia - ib) != 1 or any(getattr(v, "anchor", None) or getattr(v, "after", None) or getattr(v, "beside", False)
+                                           for v in (xa, xb)):
+                                ok = False
+                                break
+                            if orient is None:
+                                orient = ia < ib
+                            elif orient != (ia < ib):
+                                ok = False
+                                break
+                            rows[r] = (min(ia, ib), ls)
+                        if not ok or not rows:
+                            continue
+                        order = {r: list(ls) for r, (_, ls) in rows.items()}
+                        for r, (i0, ls) in rows.items():
+                            ls[i0], ls[i0 + 1] = ls[i0 + 1], ls[i0]
+                            reindex(ls)
+                        new = total()
+                        if new < cur:
+                            cur, improved = new, True
+                        else:
+                            for r, ls in order.items():
+                                layers[r][:] = ls
+                                reindex(layers[r])
+                if not improved:
+                    break
+        swap_columns()
     sift_rows()
     place_all()
 
@@ -941,7 +1013,8 @@ def layout_items(L, n, items, header_h, header_w, pad):
         if t.id not in tout and t.kind != "dummy" and t.x + 5 < sx < t.x + t.w - 5 and all(
                 abs(t.x + o - sx) > 6 for (tid, pid), o in in_off.items() if tid == t.id and pid != id(p)):
             return sx
-        if f.id not in tin and f.kind != "dummy" and f.x + 5 < ex < f.x + f.w - 5 and all(
+        if f.id not in tin and f.kind != "dummy" and f.x + 5 < ex < f.x + f.w - 5 \
+                and len([q for q in outs_all[f.id] if q.gk == p.gk]) == 1 and all(
                 abs(f.x + o - ex) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
             return ex
         return None
@@ -986,15 +1059,19 @@ def layout_items(L, n, items, header_h, header_w, pad):
         else:
             ex = t.x + in_off.get((t.id, id(p)), 0.0)
             ey = (0.0 if t.id in tout else (t.ly if t.kind == "dummy" else t.y + t.h))
-        if 0.5 < abs(sx - ex) < JOG and not (f.id in lat_in or t.id in lat_out):
-            # a trunk that is a hair off the port it leaves from / arrives at: slide the port onto the trunk
+        if abs(sx - ex) > 0.5 and not (f.id in lat_in or t.id in lat_out):
+            # a trunk that is off the port it leaves from / arrives at: slide the port onto the trunk (if it stays
+            # inside the node and does not pass another port of that node)
+            lo, hi = min(sx, ex), max(sx, ex)
             if t.kind == "dummy" and f.kind != "dummy" and f.id not in tin and f.x + 5 < ex < f.x + f.w - 5 \
                     and len([q for q in outs_all[f.id] if q.gk == p.gk]) == 1 \
-                    and all(abs(f.x + o - ex) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
+                    and all(abs(f.x + o - ex) > 6 and not lo - 3 <= f.x + o <= hi + 3
+                            for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
                 out_off[(f.id, p.gk)] = ex - f.x
                 sx = ex
             elif f.kind == "dummy" and t.kind != "dummy" and t.id not in tout and t.x + 5 < sx < t.x + t.w - 5 \
-                    and all(abs(t.x + o - sx) > 6 for (tid, pid), o in in_off.items() if tid == t.id and pid != id(p)):
+                    and all(abs(t.x + o - sx) > 6 and not lo - 3 <= t.x + o <= hi + 3
+                            for (tid, pid), o in in_off.items() if tid == t.id and pid != id(p)):
                 in_off[(t.id, id(p))] = sx - t.x
                 ex = sx
         if f.id in lat_in:
@@ -1004,7 +1081,7 @@ def layout_items(L, n, items, header_h, header_w, pad):
         elif 0.5 < abs(sx - ex) < 3.0 and (f.kind == "dummy" or t.kind == "dummy"):
             x = ex if f.kind == "dummy" else sx           # a trunk that is a hair off its port: follow the real end
             pts = [(x, sy), (x, ey)]
-        elif 0.5 < abs(sx - ex) < JOG and f.kind != "dummy" and t.kind != "dummy" and snap_x(p, f, t, sx, ex) is not None:
+        elif abs(sx - ex) > 0.5 and f.kind != "dummy" and t.kind != "dummy" and snap_x(p, f, t, sx, ex) is not None:
             x = snap_x(p, f, t, sx, ex)
             pts = [(x, sy), (x, ey)]                     # a hair off: one straight line instead of a double bend
         elif abs(sx - ex) > 0.5:

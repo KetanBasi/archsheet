@@ -112,6 +112,10 @@ class Layout:
             rows.append(("in" if i == 0 else "", txt, "io"))
         if len(n.in_metas) > limit:
             rows.append(("", f"+{len(n.in_metas) - limit} more", "io"))
+        for m in n.in_ext[:3]:
+            rows.append(("", "+ " + self.sym.shape(m), "io"))
+        if len(n.in_ext) > 3:
+            rows.append(("", f"+{len(n.in_ext) - 3} more read", "io"))
         rows += [("", a, "ann") for a in n.in_ann[:3]]
         for i, m in enumerate(n.out_metas[:limit]):
             rows.append(("out" if i == 0 else "", self.sym.shape(m), "io"))

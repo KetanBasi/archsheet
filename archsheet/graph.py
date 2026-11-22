@@ -580,31 +580,31 @@ class Graph:
             for k in range(1, lu):
                 X = pu[k]
                 tm = self._leaving(e, X)
-                tag = self._tag(X, "out", (u.id, tm), tm, "")
+                tag = self._tag(X, "out", (u.id, e.mfrom), tm, "")
                 mark(tag, cross_phase)
                 sg = self._seg(e, pu[k - 1], tag, self._leaving(e, pu[k - 1]), tm, X)
                 if k > 1:                                   # nested container: line up with its own port
-                    sg.src_tag = pu[k - 1].tags_out.get((u.id, self._leaving(e, pu[k - 1])))
+                    sg.src_tag = pu[k - 1].tags_out.get((u.id, e.mfrom))
                 self._add(X, sg)
             # ... crosses the lowest common container ...
             top = self._seg(e, pu[lu - 1], pv[lv - 1], self._leaving(e, pu[lu - 1]),
                             self._entering(e, pv[lv - 1]), lca)
             if lu > 1:
-                top.src_tag = pu[lu - 1].tags_out.get((u.id, self._leaving(e, pu[lu - 1])))
+                top.src_tag = pu[lu - 1].tags_out.get((u.id, e.mfrom))
             # ... and enters containers pv[lv-1 .. 1]
             for k in range(1, lv):
                 X = pv[k]
                 tm = self._entering(e, X)
-                tag = self._tag(X, "in", (u.id, tm), tm, pu[lu - 1].name)
+                tag = self._tag(X, "in", (u.id, e.mfrom), tm, pu[lu - 1].name)
                 mark(tag, cross_phase)
                 if cross_phase:                              # arrives from the left: sort left of the main input
                     tag.bias = -0.3
                 sg = self._seg(e, tag, pv[k - 1], tm, self._entering(e, pv[k - 1]), X)
                 if k > 1:
-                    sg.dst_tag = pv[k - 1].tags_in.get((u.id, self._entering(e, pv[k - 1])))
+                    sg.dst_tag = pv[k - 1].tags_in.get((u.id, e.mfrom))
                 self._add(X, sg)
             if lv > 1:
-                top.dst_tag = pv[lv - 1].tags_in.get((u.id, self._entering(e, pv[lv - 1])))
+                top.dst_tag = pv[lv - 1].tags_in.get((u.id, e.mfrom))
             cu, cv = pu[lu - 1], pv[lv - 1]
             if e.label and top.fid not in self._label_done:      # a flow's name is shown exactly once
                 top.carry = True
@@ -650,6 +650,10 @@ class Graph:
         card = lambda n: (n.kind in ("module", "input") or (n.kind == "op" and n.name not in self._GLYPH))
         for segs in self.segments.values():
             for s in segs:
+                d = s.dst
+                if d.kind == "module" and d.in_metas and not any(m.shape == s.mto.shape for m in d.in_metas) \
+                        and not any(m.shape == s.mto.shape for m in d.in_ext):
+                    d.in_ext.append(s.mto)         # an arrow with no `in` row: say what it carries
                 if not s.ann:
                     continue
                 txt = self._ann_text(s)

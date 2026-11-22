@@ -74,7 +74,10 @@ uses `uv` / `poetry` / a venv, run the commands through it.
   border and enter the later one's left border; several of them are ordered to avoid crossing each other.
   A tensor that only travels to another phase also leaves / enters the blocks it sits in through their side
   border at the height of its producer / consumer, instead of looping over the block's top / bottom.
-- Rows, track levels and shared trunks are ordered to minimise crossings (barycentre + sifting passes); a
+- A card lists every arrow that enters it: `+ [b, s, di]` rows under `in` are tensors the block reads from
+  outside that are not `forward()` arguments (shared state, masks). One tensor enters a block once, however
+  many reshaped views its inner ops take.
+- Rows, track levels and shared trunks are ordered to minimise crossings (barycentre sweeps, then sifting of single nodes and of whole chains); a
   trunk stays on one vertical line where it can, and two ports a hair apart on one flow become one straight
   line, not a double bend.
 - Flows are identified by their *producer*: K and V from one projector are two lines; give each its own

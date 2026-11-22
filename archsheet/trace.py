@@ -131,6 +131,7 @@ class Node:
         self.in_names = []          # forward() parameter names, parallel to in_metas
         self.out_metas = []
         self.cat = None             # (dim, [sizes along dim]) for concatenations
+        self.in_ext = []            # tensors read from outside that are not forward() arguments (state, masks ...)
         self.out_ann, self.in_ann = [], []     # "↳ view,transpose [..]" rows shown on the node itself
         self.side = None            # tags: 'L' / 'R' when the port sits on a side border (phases)
         self.extra = ""
