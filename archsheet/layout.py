@@ -862,6 +862,38 @@ def layout_items(L, n, items, header_h, header_w, pad):
                 for o, gk in zip(offs, sorted(groups, key=lambda g: sum(dst_at(q) for q in groups[g]) / len(groups[g]))):
                     out_off[(v.id, gk)] = o
     reorder_ports()
+    def square_up():
+        """A card that is the only consumer of a card's only output should sit straight above it, not a few ports
+        away: slide it into line when its row has room."""
+        for p in sorted(pieces.values(), key=lambda q: nl(q.frm)):
+            f, t = p.frm, p.to
+            if p.side or p.lane or p.xside or f.id in pinned or t.id in pinned or f.kind in ("dummy", "input", "output", "tag") or t.kind in ("dummy", "input", "output", "tag") \
+                    or f.w == 0 or t.w == 0 or len(ins_all[t.id]) != 1 \
+                    or len([q for q in outs_all[f.id] if q.gk == p.gk]) != 1:
+                continue
+            dx = (f.lx + f.w / 2) - (t.lx + t.w / 2)           # centre of one card over the centre of the other
+            if not 1.0 < abs(dx) <= 90:
+                continue
+            for mover, sign in ((t, 1), (f, -1)):
+                straight_elsewhere = any(
+                    abs((q.frm.lx + out_off[(q.frm.id, q.gk)]) - (q.to.lx + in_off[(q.to.id, id(q))])) < 0.5
+                    for q in ins_all[mover.id] + outs_all[mover.id]
+                    if q is not p and not q.side and (q.frm.id, q.gk) in out_off and (q.to.id, id(q)) in in_off)
+                if straight_elsewhere or len(ins_all[mover.id]) > 1 or len({q.gk for q in outs_all[mover.id]}) > 1:
+                    continue
+                nodes = layers[nl(mover)]
+                i = nodes.index(mover)
+                lo = nodes[i - 1].lx + nodes[i - 1].w + gap(nodes[i - 1], mover) if i > 0 else -1e9
+                hi = nodes[i + 1].lx - mover.w - gap(mover, nodes[i + 1]) if i + 1 < len(nodes) else 1e9
+                new = mover.lx + sign * dx
+                if lo - 1e-6 <= new <= hi + 1e-6:
+                    mover.lx = new
+                    land = f.lx + out_off[(f.id, p.gk)] - t.lx
+                    if 5 < land < t.w - 5 and all(abs(land - in_off[(t.id, id(q))]) >= 12
+                                                  for q in ins_all[t.id] if q is not p and (t.id, id(q)) in in_off):
+                        in_off[(t.id, id(p))] = land
+                    break
+    square_up()
     def align_chains():
         """Two dummies of one flow a hair apart would draw two parallel lines (one per out-piece): give them one x."""
         for _ in range(3):
@@ -874,6 +906,19 @@ def layout_items(L, n, items, header_h, header_w, pad):
     for v in all_nodes:
         v.lx -= minx
     W = max([v.lx + v.w for v in all_nodes] + [0])
+    if n.kind != "scene" and getattr(n, "hlines", None):
+        # an exit line runs up through the header: keep it right of the header text plates, never under them
+        rights = L.plate_rights(n)
+        for v in all_nodes:
+            if v.id in tout and v.kind == "tag" and v.id not in pinned and v.id not in lat_out and ins_all[v.id]:
+                lowest = min(v.lx + in_off.get((v.id, id(q)), 0.0) for q in ins_all[v.id])
+                hit = [r for r in rights if r + 6 - pad > lowest]
+                if len(hit) >= 3:                  # a couple of plates only breaks the line briefly; many make it look cut
+                    d = max(hit) + 6 - pad - lowest
+                    if not any(o is not v and o.lx < v.lx + d + v.w + 10 and o.lx + o.w > v.lx + d - 10
+                               for o in layers[layer[v.id]]):
+                        v.lx += d
+        W = max([v.lx + v.w for v in all_nodes] + [0])
 
     # ------------------------------------------------------------------ 5. rows, gaps, tracks
     row_h = {l: max([v.h for v in layers[l]] + [0]) for l in range(K + 1)}

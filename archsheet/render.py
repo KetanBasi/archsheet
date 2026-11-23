@@ -223,6 +223,15 @@ class Layout:
         hw += 28 + (44 if n.repeat > 1 else 0)
         return lines, 12 + 15 * len(lines), hw
 
+    def plate_rights(self, n):
+        """Right edges of the header text plates of a container (lines must not run under many of them)."""
+        out = []
+        for st, a_, b_ in n.hlines:
+            wtxt = self.row_w(a_) if st == "row" else tw(a_, 12.5 if st == "title" else 10.5) + (
+                (tw(b_, 10.5) + 10) if (st == "title" and b_) else 0)
+            out.append(10 + wtxt + 8)
+        return out
+
     def size_container(self, n):
         items = list(n.dchildren) + list(n.tags_in.values()) + list(n.tags_out.values())
         for it in items:

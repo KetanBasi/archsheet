@@ -80,7 +80,8 @@ uses `uv` / `poetry` / a venv, run the commands through it.
 - Rows, track levels and shared trunks are ordered to minimise crossings (barycentre sweeps, then sifting of single nodes and of whole chains); a
   trunk stays on one vertical line where it can, and two ports a hair apart on one flow become one straight
   line, not a double bend. A bundle of lines between two cards that are all shifted by the same amount gets
-  its ports slid together so they run straight, and lines are never stacked on top of one another.
+  its ports slid together so they run straight, and lines are never stacked on top of one another. An exit line never runs under a tall container header
+  (it is moved clear of the text), and a card that is the only consumer of another's only output is centred over it.
 - Flows are identified by their *producer*: K and V from one projector are two lines; give each its own
   `label(...)`.
 
