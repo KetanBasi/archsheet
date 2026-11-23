@@ -869,6 +869,7 @@ def layout_items(L, n, items, header_h, header_w, pad):
             f, t = p.frm, p.to
             if p.side or p.lane or p.xside or f.id in pinned or t.id in pinned or f.kind in ("dummy", "input", "output", "tag") or t.kind in ("dummy", "input", "output", "tag") \
                     or f.w == 0 or t.w == 0 or len(ins_all[t.id]) != 1 \
+                    or any(sg.src_tag for sg in p.segs if sg.src is f) or any(sg.dst_tag for sg in p.finals if sg.dst is t) \
                     or len([q for q in outs_all[f.id] if q.gk == p.gk]) != 1:
                 continue
             dx = (f.lx + f.w / 2) - (t.lx + t.w / 2)           # centre of one card over the centre of the other
@@ -899,7 +900,8 @@ def layout_items(L, n, items, header_h, header_w, pad):
         for _ in range(3):
             for p in sorted(pieces.values(), key=lambda q: q.frm.ly):
                 f, t = p.frm, p.to
-                if f.kind == "dummy" and t.kind == "dummy" and 0.0 < abs(f.lx - t.lx) < 3.0:
+                if f.kind == "dummy" and t.kind == "dummy" and 0.0 < abs(f.lx - t.lx) < 3.0 and not any(
+                        o is not t and o.lx - 14 < f.lx and o.lx + o.w + 14 > f.lx for o in layers[layer.get(t.id, t.layer)]):
                     t.lx = f.lx
     align_chains()
     minx = min((v.lx for v in all_nodes), default=0)      # tight on the left: no empty margin
@@ -1113,10 +1115,12 @@ def layout_items(L, n, items, header_h, header_w, pad):
 
     def snap_x(p, f, t, sx, ex):
         """Common x for a Z-shaped piece whose ends are nearly aligned, or None if neither end can move."""
-        if t.id not in tout and t.kind != "dummy" and t.x + 5 < sx < t.x + t.w - 5 and all(
+        src_bound = any(sg.src_tag for sg in p.segs if sg.src is f)
+        dst_bound = any(sg.dst_tag for sg in p.finals if sg.dst is t)
+        if not dst_bound and t.id not in tout and t.kind != "dummy" and t.x + 5 < sx < t.x + t.w - 5 and all(
                 abs(t.x + o - sx) > 6 for (tid, pid), o in in_off.items() if tid == t.id and pid != id(p)):
             return sx
-        if f.id not in tin and f.kind != "dummy" and f.x + 5 < ex < f.x + f.w - 5 \
+        if not src_bound and f.id not in tin and f.kind != "dummy" and f.x + 5 < ex < f.x + f.w - 5 \
                 and len([q for q in outs_all[f.id] if q.gk == p.gk]) == 1 and all(
                 abs(f.x + o - ex) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
             return ex
@@ -1140,15 +1144,17 @@ def layout_items(L, n, items, header_h, header_w, pad):
                 continue
             d = sum(ds) / len(ds)
             mine = {id(q) for q in grp}
+            in_fixed = any(sg.dst_tag for q in grp for sg in q.finals if sg.dst is t)     # ports bound to inner tags
+            out_fixed = any(sg.src_tag for q in grp for sg in q.segs if sg.src is f)
             new_in = {id(q): ex[id(q)] - d for q in grp}
-            if t.id not in tout and all(t.x + 5 < v < t.x + t.w - 5 for v in new_in.values()) and all(
+            if not in_fixed and t.id not in tout and all(t.x + 5 < v < t.x + t.w - 5 for v in new_in.values()) and all(
                     abs(t.x + o - v) > 6 for (tid, pid), o in in_off.items() if tid == t.id and pid not in mine
                     for v in new_in.values()):
                 for q in grp:
                     in_off[(t.id, id(q))] = new_in[id(q)] - t.x
                 continue
             gks = {q.gk for q in grp}
-            if f.id not in tin and all(len([r for r in outs_all[f.id] if r.gk == q.gk]) == 1 for q in grp):
+            if not out_fixed and f.id not in tin and all(len([r for r in outs_all[f.id] if r.gk == q.gk]) == 1 for q in grp):
                 new_out = {q.gk: ex[id(q)] for q in grp}
                 if all(f.x + 5 < v < f.x + f.w - 5 for v in new_out.values()) and all(
                         abs(f.x + o - v) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ not in gks
@@ -1197,17 +1203,19 @@ def layout_items(L, n, items, header_h, header_w, pad):
         else:
             ex = t.x + in_off.get((t.id, id(p)), 0.0)
             ey = (0.0 if t.id in tout else (t.ly if t.kind == "dummy" else t.y + t.h))
+        src_bound = any(sg.src_tag for sg in p.segs if sg.src is f)            # port fixed by an inner tag
+        dst_bound = any(sg.dst_tag for sg in p.finals if sg.dst is t)
         if abs(sx - ex) > 0.5 and not (f.id in lat_in or t.id in lat_out):
             # a trunk that is off the port it leaves from / arrives at: slide the port onto the trunk (if it stays
             # inside the node and does not pass another port of that node)
             lo, hi = min(sx, ex), max(sx, ex)
-            if t.kind == "dummy" and f.kind != "dummy" and f.id not in tin and f.x + 5 < ex < f.x + f.w - 5 \
+            if t.kind == "dummy" and f.kind != "dummy" and not src_bound and f.id not in tin and f.x + 5 < ex < f.x + f.w - 5 \
                     and len([q for q in outs_all[f.id] if q.gk == p.gk]) == 1 \
                     and all(abs(f.x + o - ex) > 6 and not lo - 3 <= f.x + o <= hi + 3
                             for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
                 out_off[(f.id, p.gk)] = ex - f.x
                 sx = ex
-            elif f.kind == "dummy" and t.kind != "dummy" and t.id not in tout and t.x + 5 < sx < t.x + t.w - 5 \
+            elif f.kind == "dummy" and t.kind != "dummy" and not dst_bound and t.id not in tout and t.x + 5 < sx < t.x + t.w - 5 \
                     and all(abs(t.x + o - sx) > 6 and not lo - 3 <= t.x + o <= hi + 3
                             for (tid, pid), o in in_off.items() if tid == t.id and pid != id(p)):
                 in_off[(t.id, id(p))] = sx - t.x
