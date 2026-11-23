@@ -862,6 +862,14 @@ def layout_items(L, n, items, header_h, header_w, pad):
                 for o, gk in zip(offs, sorted(groups, key=lambda g: sum(dst_at(q) for q in groups[g]) / len(groups[g]))):
                     out_off[(v.id, gk)] = o
     reorder_ports()
+    def align_chains():
+        """Two dummies of one flow a hair apart would draw two parallel lines (one per out-piece): give them one x."""
+        for _ in range(3):
+            for p in sorted(pieces.values(), key=lambda q: q.frm.ly):
+                f, t = p.frm, p.to
+                if f.kind == "dummy" and t.kind == "dummy" and 0.0 < abs(f.lx - t.lx) < 3.0:
+                    t.lx = f.lx
+    align_chains()
     minx = min((v.lx for v in all_nodes), default=0)      # tight on the left: no empty margin
     for v in all_nodes:
         v.lx -= minx
@@ -956,11 +964,17 @@ def layout_items(L, n, items, header_h, header_w, pad):
             return [(p.gk, port_x(p), land_x(p)) for tr in lv["trs"] for p in tr["pieces"]
                     if p.frm.id not in lat_in and p.to.id not in lat_out]
         cache = {id(lv): live(lv) for lv in levels}
+        ends = {id(lv): ([(p.gk, port_x(p)) for tr in lv["trs"] for p in tr["pieces"] if p.frm.id not in lat_in],
+                         [(p.gk, land_x(p)) for tr in lv["trs"] for p in tr["pieces"] if p.to.id not in lat_out])
+                for lv in levels}
 
         def above(X, Y):
             """crossings between two levels if X is drawn above Y (nearer the target): Y's target vertical runs up
             through X's horizontal, and X's source vertical runs down through Y's horizontal"""
             c = 0
+            for gx, sx in ends[id(X)][0]:             # X's rising source line would lie on Y's rising target line
+                for gy, ty in ends[id(Y)][1]:
+                    c += 3 * (gx != gy and abs(sx - ty) < 4)
             for gx, sx, tx in cache[id(X)]:
                 for gy, sy, ty in cache[id(Y)]:
                     if gx == gy:
@@ -1062,6 +1076,41 @@ def layout_items(L, n, items, header_h, header_w, pad):
                 abs(f.x + o - ex) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ != p.gk):
             return ex
         return None
+    def shear_ports():
+        """Several lines from one card to another that are all shifted by the same small amount would draw a staircase
+        of Z-bends: move the ports of the target (or source) card together so the lines run straight."""
+        pair = defaultdict(list)
+        for q in pieces.values():
+            f, t = q.frm, q.to
+            if q.lane or q.side or q.xside or f.kind == "dummy" or t.kind == "dummy" or (f.id in tin and t.id in tout) \
+                    or f.id in lat_in or t.id in lat_out or any(s_.alines for s_ in q.finals):
+                continue
+            pair[("tin" if f.id in tin else f.id, t.id)].append(q)
+        for grp in pair.values():
+            f, t = grp[0].frm, grp[0].to
+            sx = {id(q): q.frm.x + out_off.get((q.frm.id, q.gk), 0.0) for q in grp}
+            ex = {id(q): t.x + in_off.get((t.id, id(q)), 0.0) for q in grp}
+            ds = [ex[id(q)] - sx[id(q)] for q in grp]
+            if len(grp) < 2 or abs(ds[0]) <= 0.5 or max(ds) - min(ds) > 1.5:
+                continue
+            d = sum(ds) / len(ds)
+            mine = {id(q) for q in grp}
+            new_in = {id(q): ex[id(q)] - d for q in grp}
+            if t.id not in tout and all(t.x + 5 < v < t.x + t.w - 5 for v in new_in.values()) and all(
+                    abs(t.x + o - v) > 6 for (tid, pid), o in in_off.items() if tid == t.id and pid not in mine
+                    for v in new_in.values()):
+                for q in grp:
+                    in_off[(t.id, id(q))] = new_in[id(q)] - t.x
+                continue
+            gks = {q.gk for q in grp}
+            if f.id not in tin and all(len([r for r in outs_all[f.id] if r.gk == q.gk]) == 1 for q in grp):
+                new_out = {q.gk: ex[id(q)] for q in grp}
+                if all(f.x + 5 < v < f.x + f.w - 5 for v in new_out.values()) and all(
+                        abs(f.x + o - v) > 6 for (fid_, gk_), o in out_off.items() if fid_ == f.id and gk_ not in gks
+                        for v in new_out.values()):
+                    for q in grp:
+                        out_off[(f.id, q.gk)] = new_out[q.gk] - f.x
+    shear_ports()
     for p in pieces.values():
         f, t = p.frm, p.to
         arrow = any(s.dst is t and s.dst.kind != "tag" and s.dst_tag is None for s in p.finals)

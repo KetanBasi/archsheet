@@ -79,7 +79,8 @@ uses `uv` / `poetry` / a venv, run the commands through it.
   many reshaped views its inner ops take.
 - Rows, track levels and shared trunks are ordered to minimise crossings (barycentre sweeps, then sifting of single nodes and of whole chains); a
   trunk stays on one vertical line where it can, and two ports a hair apart on one flow become one straight
-  line, not a double bend.
+  line, not a double bend. A bundle of lines between two cards that are all shifted by the same amount gets
+  its ports slid together so they run straight, and lines are never stacked on top of one another.
 - Flows are identified by their *producer*: K and V from one projector are two lines; give each its own
   `label(...)`.
 
